@@ -1,0 +1,35 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.32014.148
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SRAM_programmer", "SRAM_programmer.vcxproj", "{754924FF-9C64-4A1E-960F-CD65559A4905}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|ARM = Debug|ARM
+		Debug|ARM64 = Debug|ARM64
+		Release|ARM = Release|ARM
+		Release|ARM64 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM.ActiveCfg = Debug|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM.Build.0 = Debug|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM.Deploy.0 = Debug|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM64.Build.0 = Debug|ARM64
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Debug|ARM64.Deploy.0 = Debug|ARM64
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM.ActiveCfg = Release|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM.Build.0 = Release|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM.Deploy.0 = Release|ARM
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM64.ActiveCfg = Release|ARM64
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM64.Build.0 = Release|ARM64
+		{754924FF-9C64-4A1E-960F-CD65559A4905}.Release|ARM64.Deploy.0 = Release|ARM64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {372B2A0C-CC88-4CC7-BA2C-77B343C64C5B}
+	EndGlobalSection
+EndGlobal

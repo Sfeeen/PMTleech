@@ -1,0 +1,21 @@
+{
+  "Version": 1,
+  "ProjectMap": {
+    "754924ff-9c64-4a1e-960f-cd65559a4905": {
+      "ProjectGuid": "754924ff-9c64-4a1e-960f-cd65559a4905",
+      "DisplayName": "SRAM_programmer",
+      "ColorIndex": 0
+    },
+    "0d49ddf3-f8ac-450b-80db-634b02f84957": {
+      "ProjectGuid": "0d49ddf3-f8ac-450b-80db-634b02f84957",
+      "DisplayName": "MCU_display_conversion",
+      "ColorIndex": 1
+    },
+    "a2fe74e1-b743-11d0-ae1a-00a0c90fffc3": {
+      "ProjectGuid": "a2fe74e1-b743-11d0-ae1a-00a0c90fffc3",
+      "DisplayName": "Miscellaneous Files",
+      "ColorIndex": -1
+    }
+  },
+  "NextColorIndex": 2
+}
