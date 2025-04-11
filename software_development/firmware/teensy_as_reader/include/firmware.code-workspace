@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "teensy_as_reader",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
