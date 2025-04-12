@@ -78,6 +78,10 @@ std::atomic<bool> streaming_mode_enabled{ false };
 bool show_save_bin_popup = false;
 char unknown_byte_input[5] = "FF";
 
+std::string temp_mt_log_filename = "temp_mt_log.mt";
+std::ofstream mt_log_file;
+
+
 
 
 const char* pin_options[] = {
@@ -568,6 +572,11 @@ void serial_thread_func() {
 
 
                 Packet pkt{ ++counter, op, address, value };
+
+                if (mt_log_file.is_open()) {
+                    mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << std::dec << "\n";
+                }
+
                 {
                     std::lock_guard<std::mutex> lock(packet_mutex);
                     packet_buffer.push_back(pkt);
@@ -627,6 +636,9 @@ void serial_thread_func() {
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
+    // Create or clear the temp file for memory transaction logging
+    mt_log_file.open(temp_mt_log_filename, std::ios::out | std::ios::trunc);
+
     SDL_Window* window = SDL_CreateWindow("Teensy Serial Monitor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1400, 600, SDL_WINDOW_SHOWN);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
 
@@ -864,45 +876,10 @@ int main(int argc, char* argv[]) {
         }
 
         static bool teensy_streaming = false;
+        static int step_count = 1;
 
         if (serial_thread_running) {
-            if (!teensy_streaming) {
-                if (ImGui::Button("Start Streaming")) {
-                    setup_active_gpio_bits();
-                    streaming_mode_enabled = true; // Enable binary parsing
-                    asio::write(port, asio::buffer("START\n", 6));
-                    log_teensy_message("START", true);
-                    teensy_streaming = true;
-                }
-            }
-            else {
-                if (ImGui::Button("Stop Streaming")) {
-                    streaming_mode_enabled = false; // Disable binary parsing
-                    asio::write(port, asio::buffer("STOP\n", 5));
-                    log_teensy_message("STOP", true);
-                    teensy_streaming = false;
-                }
-
-                // Draw buffer backlog status dot
-                {
-                    size_t buffer_size = packet_buffer.size();
-                    const size_t warning_threshold = 500;
-
-                    ImVec4 dot_color = (buffer_size > warning_threshold)
-                        ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f)  // Red
-                        : ImVec4(0.2f, 1.0f, 0.2f, 1.0f); // Green
-                    ImGui::SameLine();
-                    ImGui::Text("Buffer Status: ");
-                    ImGui::SameLine();
-                    ImGui::ColorButton("##buffer_dot", dot_color, ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop, ImVec2(12, 12));
-
-                    ImGui::SameLine();
-                    ImGui::Text("%s", buffer_size > warning_threshold ? "Backlog detected" : "Healthy");
-                }
-
-            }
-            ImGui::NewLine();
-
+            ImGui::SameLine();
             if (teensy_streaming) ImGui::BeginDisabled();
 
             //ImGui::SameLine();
@@ -951,8 +928,87 @@ int main(int argc, char* argv[]) {
 
             if (teensy_streaming) ImGui::EndDisabled();
 
+            if (!teensy_streaming) {
+                if (ImGui::Button("Start Streaming")) {
+                    setup_active_gpio_bits();
+                    streaming_mode_enabled = true;
+                    asio::write(port, asio::buffer("START\n", 6));
+                    log_teensy_message("START", true);
+                    teensy_streaming = true;
+                }
+
+                ImGui::SameLine();
+
+                ImGui::SetNextItemWidth(120);
+                ImGui::InputInt("##step_count", &step_count);
+                if (step_count < 1) step_count = 1;
+
+                ImGui::SameLine();
+
+                if (ImGui::Button("Step")) {
+                    std::string cmd = "STEP_" + std::to_string(step_count) + "\n";
+                    asio::write(port, asio::buffer(cmd));
+                    log_teensy_message(cmd, true);
+                }
+
+                if (ImGui::Button("Reset CPU")) {
+                    std::string cmd = "RESET_CPU \n";
+                    asio::write(port, asio::buffer(cmd));
+                    log_teensy_message(cmd, true);
+                }
+            }
+
+            else {
+                if (ImGui::Button("Stop Streaming")) {
+                    streaming_mode_enabled = false; // Disable binary parsing
+                    asio::write(port, asio::buffer("STOP\n", 5));
+                    log_teensy_message("STOP", true);
+                    teensy_streaming = false;
+                }
+
+                // Draw buffer backlog status dot
+                {
+                    size_t buffer_size = packet_buffer.size();
+                    const size_t warning_threshold = 500;
+
+                    ImVec4 dot_color = (buffer_size > warning_threshold)
+                        ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f)  // Red
+                        : ImVec4(0.2f, 1.0f, 0.2f, 1.0f); // Green
+                    ImGui::SameLine();
+                    ImGui::Text("Buffer Status: ");
+                    ImGui::SameLine();
+                    ImGui::ColorButton("##buffer_dot", dot_color, ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop, ImVec2(12, 12));
+
+                    ImGui::SameLine();
+                    ImGui::Text("%s", buffer_size > warning_threshold ? "Backlog detected" : "Healthy");
+                }
+
+            }
+            ImGui::NewLine();
+
             //ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "Teensy Status: %s", teensy_status_message.c_str());
 
+            if (ImGui::Button("Save MT file")) {
+                char filename[MAX_PATH] = {};
+                strcpy_s(filename, "transactions.mt");
+
+                OPENFILENAMEA ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = NULL;
+                ofn.lpstrFilter = "Memory Transactions\0*.mt\0All Files\0*.*\0";
+                ofn.lpstrFile = filename;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = "Save Memory Transactions";
+                ofn.lpstrDefExt = "mt";
+                ofn.Flags = OFN_OVERWRITEPROMPT;
+
+                if (GetSaveFileNameA(&ofn)) {
+                    std::ifstream temp_in(temp_mt_log_filename, std::ios::binary);
+                    std::ofstream perm_out(ofn.lpstrFile, std::ios::binary);
+                    perm_out << temp_in.rdbuf();
+                }
+            }
+            ImGui::SameLine();
 
             if (ImGui::Button("Clear All Data")) {
                 {

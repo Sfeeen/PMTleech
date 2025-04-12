@@ -8,6 +8,7 @@
 #define EXT_CLK_PIN 29
 
 #define RUNNING_PIN 2
+#define RESET_CPU_PIN 3
 
 
 enum RunMode : uint8_t {
@@ -94,7 +95,6 @@ void enter_running_mode() {
   } else {
     // sample_timer.begin(continuous_sample, 1000000UL / config.freq);
   }
-  pinMode(EXT_CLK_PIN, OUTPUT);
   analogWriteFrequency(EXT_CLK_PIN, config.freq);
   analogWrite(EXT_CLK_PIN, 128);  // 50% duty cycle
 
@@ -114,7 +114,12 @@ void enter_idle_mode() {
   } else {
     //sample_timer.end();
   }
-  pinMode(EXT_CLK_PIN, INPUT);  // High impedance
+
+
+  analogWrite(EXT_CLK_PIN, 0);      // Optional: reduces duty to 0%
+  pinMode(EXT_CLK_PIN, OUTPUT);     // Force pin as GPIO output
+  digitalWriteFast(EXT_CLK_PIN, LOW); // Drive LOW
+
 
   digitalWrite(RUNNING_PIN, LOW);
   state = IDLE;
@@ -156,6 +161,8 @@ void setup() {
   Serial.begin(2000000);
   pinMode(RUNNING_PIN, OUTPUT);
   digitalWrite(RUNNING_PIN, LOW);
+  pinMode(EXT_CLK_PIN, OUTPUT);
+  digitalWrite(EXT_CLK_PIN, LOW);
   load_config_from_eeprom();
   Serial.println("BOOTED");
 }
@@ -175,6 +182,49 @@ FASTRUN void loop() {
         parse_config_line(serial_buffer);
       } else if (serial_buffer == "GETCFG") {
         handle_get_config();
+      } else if (serial_buffer == "RESET_CPU") {
+        pinMode(RESET_CPU_PIN, OUTPUT);
+        digitalWriteFast(RESET_CPU_PIN, LOW);
+        delay(100);
+        pinMode(RESET_CPU_PIN, INPUT);
+        send_ack("ACK RESET_CPU");
+      } else if (serial_buffer.startsWith("STEP_")) {
+        int steps = serial_buffer.substring(5).toInt();
+        if (steps <= 0) steps = 1;
+      
+        // --- Enter STEP MODE (simulate running)
+        digitalWriteFast(RUNNING_PIN, HIGH);
+      
+        if (config.we_pin != (uint8_t)-1) {
+          pinMode(config.we_pin, INPUT);
+          attachInterrupt(digitalPinToInterrupt(config.we_pin), handle_memory_access, FALLING);
+        }
+        if (config.oe_pin != (uint8_t)-1) {
+          pinMode(config.oe_pin, INPUT);
+          attachInterrupt(digitalPinToInterrupt(config.oe_pin), handle_memory_access, FALLING);
+        }
+      
+        // --- Pulse EXT_CLK
+        
+        unsigned long half_period_us = 500000UL / config.freq;
+      
+        for (int i = 0; i < steps; ++i) {
+          digitalWriteFast(EXT_CLK_PIN, HIGH);
+          delayMicroseconds(half_period_us);
+          digitalWriteFast(EXT_CLK_PIN, LOW);
+          delayMicroseconds(half_period_us);
+        }
+      
+        // --- Cleanup: detach interrupts and set idle state
+        if (config.we_pin != (uint8_t)-1) {
+          detachInterrupt(digitalPinToInterrupt(config.we_pin));
+        }
+        if (config.oe_pin != (uint8_t)-1) {
+          detachInterrupt(digitalPinToInterrupt(config.oe_pin));
+        }
+      
+        digitalWriteFast(RUNNING_PIN, LOW);
+        send_ack("STEPS DONE");
       } else {
         Serial.println("Unknown command:");
         Serial.println(serial_buffer);
