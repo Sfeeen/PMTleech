@@ -44,17 +44,27 @@ struct Packet {
     std::string op;
     uint32_t address;
     uint32_t value;
+    bool foreign_chip = false;
 };
 
 std::vector<Packet> packet_buffer;
+std::vector<Packet> full_transaction_log;
+
+std::atomic<uint64_t> current_time_counter = 0;
+
+
 std::mutex packet_mutex;
 std::atomic<bool> running{ false };
 bool serial_thread_running = false;
+std::atomic<bool> step_mode_enabled{ false };
+
 uint64_t total_bytes = 0;
 uint64_t total_packets = 0;
 uint64_t valid_packets = 0;
 uint64_t read_count = 0;
 uint64_t write_count = 0;
+uint64_t ignored_chip_packets = 0;
+
 
 std::vector<std::string> available_ports;
 std::vector<std::string> port_labels;
@@ -66,6 +76,20 @@ serial_port port(context);
 constexpr size_t MEMORY_SIZE = 64 * 1024;
 uint8_t memory_data[MEMORY_SIZE];
 bool memory_written[MEMORY_SIZE] = { false };  // Tracks if a byte is known
+bool memory_written_by_write_op[MEMORY_SIZE] = { false };
+// Add this near global memory definitions
+enum class MemColor { NONE, READ, WRITE, FOREIGN };
+MemColor memory_color[MEMORY_SIZE] = { MemColor::NONE };
+
+struct MemorySnapshot {
+    uint64_t counter;
+    uint8_t memory[MEMORY_SIZE];
+    bool written[MEMORY_SIZE];
+    bool written_by_write[MEMORY_SIZE];
+    MemColor color[MEMORY_SIZE];
+};
+std::vector<MemorySnapshot> memory_snapshots;
+constexpr size_t SNAPSHOT_INTERVAL = 30000;
 
 int selected_pin_count = 28;  // Default pin count
 
@@ -75,11 +99,35 @@ bool teensy_running = false;
 
 std::atomic<bool> streaming_mode_enabled{ false };
 
+bool breakpoint_enabled = false;
+int breakpoint_op = 0;  // 0 = both, 1 = read, 2 = write
+int breakpoint_chip = 0; // 0 = both, 1 = this chip, 2 = foreign
+char breakpoint_address_hex[9] = "";  // max 0xFFFFFFFF
+char breakpoint_value_hex[9] = "";
+
+std::atomic<bool> breakpoint_triggered{ false };
+std::atomic<uint64_t> breakpoint_trigger_time = 0;
+std::atomic<bool> pending_breakpoint_stop{ false };
+std::chrono::steady_clock::time_point breakpoint_trigger_timestamp;
+std::atomic<bool> breakpoint_pending_rebuild = false;
+
+
+static std::atomic<bool> teensy_streaming = false;
+static int step_count = 1;
+
+
+
 bool show_save_bin_popup = false;
 char unknown_byte_input[5] = "FF";
 
 std::string temp_mt_log_filename = "temp_mt_log.mt";
 std::ofstream mt_log_file;
+
+bool user_overridden_slider = false;
+std::vector<uint32_t> recent_addresses;
+
+bool scroll_to_recent_address = false;
+
 
 
 
@@ -112,6 +160,10 @@ int d1_bit_pos = -1;
 
 int we_bit_pos = -1;
 int oe_bit_pos = -1;
+int cs_bit_pos = -1;
+
+
+
 
 
 
@@ -176,69 +228,6 @@ int teensy_pin_to_bit_position(int teensy_pin) {
     return -1; // Invalid or unmapped pin
 }
 
-//void setup_active_gpio_bits() {
-//    active_address_bits.clear();
-//    active_data_bits.clear();
-//    we_bit_pos = -1;
-//    oe_bit_pos = -1;
-//
-//    int we_chip_pin = -1, oe_chip_pin = -1;
-//    int we_teensy_pin = -1, oe_teensy_pin = -1;
-//
-//    std::vector<std::pair<std::string, int>> data_pin_labels_and_bits;
-//
-//    for (int i = 0; i < TOTAL_PINS; ++i) {
-//        int idx = selected_pin_function[i];
-//        if (idx < 0 || idx >= IM_ARRAYSIZE(pin_options)) continue;
-//
-//        std::string label = pin_options[idx];
-//
-//        // Reverse-calculate chip pin for mapping
-//        int chip_pin = i + 1;
-//        if (selected_pin_count == 30) chip_pin -= 1;
-//        else if (selected_pin_count == 28) chip_pin -= 2;
-//
-//        int teensy_pin = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
-//        int bit = teensy_pin_to_bit_position(teensy_pin);
-//        if (bit == -1) continue;
-//
-//        if (label.rfind("A", 0) == 0) {
-//            active_address_bits.push_back(bit);
-//        }
-//        else if (label.rfind("D", 0) == 0) {
-//            data_pin_labels_and_bits.emplace_back(label, bit);
-//
-//            std::cout << "[GPIO Setup] " << label
-//                << " -> chip pin " << chip_pin
-//                << ", teensy pin " << teensy_pin
-//                << ", bit position " << bit << std::endl;
-//        }
-//        else if (label == "/WE") {
-//            we_bit_pos = bit;
-//            we_chip_pin = chip_pin;
-//            we_teensy_pin = teensy_pin;
-//        }
-//        else if (label == "/OE") {
-//            oe_bit_pos = bit;
-//            oe_chip_pin = chip_pin;
-//            oe_teensy_pin = teensy_pin;
-//        }
-//    }
-//
-//    std::sort(active_address_bits.begin(), active_address_bits.end());
-//
-//    // Sort D pins by label (D1 < D2 < D3 ...)
-//    std::sort(data_pin_labels_and_bits.begin(), data_pin_labels_and_bits.end(), [](const auto& a, const auto& b) {
-//        int a_num = std::stoi(a.first.substr(1)); // Skip 'D'
-//        int b_num = std::stoi(b.first.substr(1));
-//        return a_num < b_num;
-//        });
-//
-//    for (const auto& [label, bit] : data_pin_labels_and_bits) {
-//        active_data_bits.push_back(bit);
-//    }
-//}
-
 void setup_active_gpio_bits() {
     active_address_bits.clear();
     active_data_bits.clear();
@@ -290,6 +279,10 @@ void setup_active_gpio_bits() {
             oe_chip_pin = chip_pin;
             oe_teensy_pin = teensy_pin;
         }
+        else if (label == "/CS") {
+            cs_bit_pos = bit;
+        }
+
     }
 
     // Sort A pins by label (A1 < A2 < A3 ...)
@@ -532,6 +525,66 @@ std::string detect_operation(uint64_t gpio64) { // 32 WE // 33 OE
     return "";
 }
 
+// Update rebuild_memory_state_up_to
+void rebuild_memory_state_up_to(uint64_t target_counter) {
+    std::cout << "rebuilding" << std::endl;
+    //std::fill(std::begin(memory_written), std::end(memory_written), false);
+    //std::fill(std::begin(memory_data), std::end(memory_data), 0);
+    //std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
+    //std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
+    recent_addresses.clear();
+
+    // Find nearest snapshot
+    size_t start_index = 0;
+    uint64_t start_counter = 0;
+
+    for (int i = static_cast<int>(memory_snapshots.size()) - 1; i >= 0; --i) {
+        if (memory_snapshots[i].counter <= target_counter) {
+            memcpy(memory_data, memory_snapshots[i].memory, MEMORY_SIZE);
+            memcpy(memory_written, memory_snapshots[i].written, MEMORY_SIZE);
+            memcpy(memory_written_by_write_op, memory_snapshots[i].written_by_write, MEMORY_SIZE);
+            memcpy(memory_color, memory_snapshots[i].color, sizeof(memory_color));
+            start_counter = memory_snapshots[i].counter;
+            break;
+        }
+    }
+
+    recent_addresses.clear();
+
+    std::lock_guard<std::mutex> lock(packet_mutex);  // 🔒 ADD THIS
+
+    for (const Packet& pkt : full_transaction_log) {
+        if (pkt.counter <= start_counter) continue;
+        if (pkt.counter > target_counter) break;
+        if (pkt.address >= MEMORY_SIZE) continue;
+
+        memory_data[pkt.address] = static_cast<uint8_t>(pkt.value & 0xFF);
+        memory_written[pkt.address] = true;
+
+        
+        if (pkt.foreign_chip) {
+            memory_color[pkt.address] = MemColor::FOREIGN;
+        }
+        else if (pkt.op == "WRITE") {
+            memory_written_by_write_op[pkt.address] = true;
+            memory_color[pkt.address] = MemColor::WRITE;
+        }
+        else if (pkt.op == "READ") {
+            memory_color[pkt.address] = MemColor::READ;
+        }
+
+        if (recent_addresses.empty() || recent_addresses.back() != pkt.address) {
+            recent_addresses.push_back(pkt.address);
+            if (recent_addresses.size() > 10)
+                recent_addresses.erase(recent_addresses.begin());
+        }
+    }
+    if (!recent_addresses.empty()) {
+        scroll_to_recent_address = true;
+    }
+}
+
+
 
 void serial_thread_func() {
     // Use global active_address_bits and active_data_bits set by setup_active_gpio_bits()
@@ -553,16 +606,32 @@ void serial_thread_func() {
 
         total_bytes += bytes_read;
 
-        if (streaming_mode_enabled) {
+        if (streaming_mode_enabled || step_mode_enabled) {
             // 🔁 PACKET MODE
             if (bytes_read < 8) continue;
             int packet_count = static_cast<int>(bytes_read / 8);
             for (int i = 0; i < packet_count; ++i) {
                 uint64_t gpio64 = *reinterpret_cast<uint64_t*>(&buffer[i * 8]);
+                if (step_mode_enabled && gpio64 == 0xFFFFFFFFFFFFFFFFull) {
+                    step_mode_enabled = false;
+                    std::cout << "stop step mode" << std::endl;
+                    continue;  // skip this packet
+                }
+
+                bool foreign_chip = false;
+                if (cs_bit_pos >= 0 && ((gpio64 >> cs_bit_pos) & 1) != 0) {
+                    ignored_chip_packets++;
+                    foreign_chip = true;  // <- Set flag instead of skipping
+                }
+
+
                 std::string op = detect_operation(gpio64);
                 total_packets++;
 
-                if (op.empty()) continue;
+                if (op.empty()) {
+                    std::cout << "no operation found!" << std::endl;
+                    continue;
+                }
                 valid_packets++;
                 if (op == "READ") read_count++;
                 else if (op == "WRITE") write_count++;
@@ -571,7 +640,48 @@ void serial_thread_func() {
                 uint32_t value = extract_bits(gpio64, active_data_bits);
 
 
-                Packet pkt{ ++counter, op, address, value };
+                Packet pkt{ ++counter, op, address, value, foreign_chip };
+
+                if (breakpoint_enabled) {
+                    int safe_op = std::clamp(breakpoint_op, 0, 2);
+                    int safe_chip = std::clamp(breakpoint_chip, 0, 2);
+
+                    bool match = true;
+
+                    // Match op
+                    if (safe_op == 1 && pkt.op != "READ") match = false;
+                    else if (safe_op == 2 && pkt.op != "WRITE") match = false;
+
+                    // Match chip origin
+                    if (safe_chip == 1 && pkt.foreign_chip) match = false;
+                    else if (safe_chip == 2 && !pkt.foreign_chip) match = false;
+
+                    // Address
+                    if (strlen(breakpoint_address_hex) > 0) {
+                        char* endptr = nullptr;
+                        uint32_t target_addr = strtoul(breakpoint_address_hex, &endptr, 16);
+                        if (!endptr || *endptr != '\0' || pkt.address != target_addr) match = false;
+                    }
+
+                    // Value
+                    if (strlen(breakpoint_value_hex) > 0) {
+                        char* endptr = nullptr;
+                        uint32_t target_val = strtoul(breakpoint_value_hex, &endptr, 16);
+                        if (!endptr || *endptr != '\0' || pkt.value != target_val) match = false;
+                    }
+
+                    if (match && !breakpoint_triggered) {
+                        asio::write(port, asio::buffer("STOP\n", 5));
+                        log_teensy_message("STOP (breakpoint matched)", true);
+                        breakpoint_triggered = true;
+                        breakpoint_trigger_time = pkt.counter;
+                        breakpoint_trigger_timestamp = std::chrono::steady_clock::now();
+                        breakpoint_pending_rebuild = true;
+                        std::cout << "[Breakpoint] Matched and STOP sent at counter " << pkt.counter << "\n";
+                    }
+
+                }
+
 
                 if (mt_log_file.is_open()) {
                     mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << std::dec << "\n";
@@ -580,8 +690,23 @@ void serial_thread_func() {
                 {
                     std::lock_guard<std::mutex> lock(packet_mutex);
                     packet_buffer.push_back(pkt);
+                    full_transaction_log.push_back(pkt);
                     if (packet_buffer.size() > 10) packet_buffer.erase(packet_buffer.begin());
                 }
+
+                if (pkt.counter % SNAPSHOT_INTERVAL == 0) {
+                    MemorySnapshot snap;
+                    snap.counter = pkt.counter;
+                    memcpy(snap.memory, memory_data, MEMORY_SIZE);
+                    memcpy(snap.written, memory_written, MEMORY_SIZE);
+                    memcpy(snap.written_by_write, memory_written_by_write_op, MEMORY_SIZE);
+                    memcpy(snap.color, memory_color, sizeof(memory_color));
+                    memory_snapshots.push_back(snap);
+                }
+
+                //current_time_counter = pkt.counter;
+                current_time_counter.store(pkt.counter);
+
 
                 if (address < MEMORY_SIZE) {
                     memory_data[address] = static_cast<uint8_t>(value & 0xFF);
@@ -617,6 +742,10 @@ void serial_thread_func() {
                             teensy_config_response = parsed;
                             show_teensy_config_popup = true;
                         }
+                        else if (line == "STEPS DONE") {
+                            //rebuild_memory_state_up_to(current_time_counter);
+                        }
+
 
                         log_teensy_message(line, false);
                         teensy_ack_buffer.clear();
@@ -631,6 +760,7 @@ void serial_thread_func() {
 
 
     serial_thread_running = false;
+
 }
 
 
@@ -658,9 +788,27 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < port_labels.size(); ++i) {
         if (port_labels[i].find("USB Serial Device") != std::string::npos) {
             selected_port_index = i;
-            break;
+
+            try {
+                port.close();
+                port.open(available_ports[selected_port_index].c_str());
+                port.set_option(serial_port::baud_rate(2000000));
+                port.set_option(serial_port::flow_control(serial_port::flow_control::none));
+                port.set_option(serial_port::character_size(8));
+                port.set_option(serial_port::parity(serial_port::parity::none));
+                port.set_option(serial_port::stop_bits(serial_port::stop_bits::one));
+                running = true;
+                serial_thread_running = true;
+                reader = std::thread(serial_thread_func);
+            }
+            catch (const std::exception& e) {
+                std::cerr << "Auto-connect failed: " << e.what() << std::endl;
+            }
+
+            break;  // Only connect to the first matching one
         }
     }
+
 
     bool quit = false;
     while (!quit) {
@@ -741,7 +889,54 @@ int main(int argc, char* argv[]) {
         }
 
 
+        uint64_t min_counter = 0;
+        uint64_t max_counter = 0;
+        {
+            std::lock_guard<std::mutex> lock(packet_mutex);
+            if (!full_transaction_log.empty())
+                max_counter = full_transaction_log.back().counter;
+        }
+
+        //if (!user_overridden_slider && streaming_mode_enabled) {
+        //    current_time_counter = max_counter;
+        //    rebuild_memory_state_up_to(current_time_counter);
+        //}
+
+        uint64_t temp_counter = current_time_counter.load();
+        if (ImGui::SliderScalar("Time", ImGuiDataType_U64, &temp_counter, &min_counter, &max_counter)) {
+            user_overridden_slider = true;
+            current_time_counter.store(temp_counter);
+            rebuild_memory_state_up_to(temp_counter);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("##back", ImGuiDir_Left)) {
+            uint64_t t = current_time_counter.load();
+            if (t > 0) {
+                t--;
+                current_time_counter.store(t);
+                rebuild_memory_state_up_to(t);
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("##forward", ImGuiDir_Right)) {
+            uint64_t t = current_time_counter.load();
+            if (t < max_counter) {
+                t++;
+                current_time_counter.store(t);
+                rebuild_memory_state_up_to(t);
+            }
+        }
+
         ImGui::BeginChild("HexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+        if (scroll_to_recent_address && !recent_addresses.empty()) {
+            int latest_addr = recent_addresses.back();
+            float line_height = ImGui::GetTextLineHeightWithSpacing();
+            float scroll_y = (latest_addr / 16) * line_height;
+            ImGui::SetScrollY(scroll_y - ImGui::GetWindowHeight() * 0.5f);  // Center on it
+            scroll_to_recent_address = false;
+        }
+
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
         ImGui::PushFont(ImGui::GetFont());
 
@@ -765,24 +960,53 @@ int main(int argc, char* argv[]) {
 
         // Hex + ASCII rows
         for (size_t row = 0; row < MEMORY_SIZE; row += 16) {
-            // Offset label
             ImGui::Text("%08X", static_cast<unsigned int>(row));
             ImGui::SameLine(70);
 
-            // Hex bytes
             for (int col = 0; col < 16; ++col) {
                 size_t addr = row + col;
-                if (addr < MEMORY_SIZE) {
-                    if (memory_written[addr])
-                        ImGui::Text("%02X", memory_data[addr]);
-                    else
-                        ImGui::TextDisabled("??");
+                if (addr >= MEMORY_SIZE) continue;
+
+                bool is_recent = false;
+                int recent_index = -1;
+
+                for (int i = 0; i < recent_addresses.size(); ++i) {
+                    if (recent_addresses[i] == addr) {
+                        is_recent = true;
+                        recent_index = i;
+                        break;
+                    }
+                }
+
+                if (memory_written[addr]) {
+                    if (is_recent) {
+                        static const ImVec4 red_shades[10] = {
+                            ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                            ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+                            ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
+                            ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+                        };
+                        ImVec4 shade = red_shades[9 - std::min(recent_index, 9)];
+                        ImGui::TextColored(shade, "%02X", memory_data[addr]);
+                    }
+                    else {
+                        ImVec4 color;
+                        switch (memory_color[addr]) {
+                        case MemColor::READ: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break; // white
+                        case MemColor::WRITE: color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); break; // green
+                        case MemColor::FOREIGN: color = ImVec4(0.8f, 0.4f, 1.0f, 1.0f); break; // purple
+                        default: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
+                        }
+                        ImGui::TextColored(color, "%02X", memory_data[addr]);
+                    }
                 }
                 else {
-                    ImGui::Text("  ");
+                    ImGui::TextDisabled("??");
                 }
+
                 if (col != 15) ImGui::SameLine();
             }
+
 
             // ASCII preview
             ImGui::SameLine(ascii_start_x);
@@ -802,19 +1026,6 @@ int main(int argc, char* argv[]) {
         ImGui::PopStyleVar();
         ImGui::EndChild();
         ImGui::End();
-
-        //int active_tab = 0;
-
-        //if (ImGui::BeginMainMenuBar()) {
-        //    if (ImGui::BeginMenu("View")) {
-        //        if (ImGui::MenuItem("Memory View", NULL, active_tab == 0)) active_tab = 0;
-        //        if (ImGui::MenuItem("Packet Monitor", NULL, active_tab == 1)) active_tab = 1;
-        //        if (ImGui::MenuItem("Chip Configuration", NULL, active_tab == 2)) active_tab = 2;
-        //        ImGui::EndMenu();
-        //    }
-        //    ImGui::EndMainMenuBar();
-        //}
-
 
 
         ImGui::SetNextWindowSize(ImVec2(500, 500), ImGuiCond_Once);
@@ -875,12 +1086,11 @@ int main(int argc, char* argv[]) {
             context.restart();  // reset asio for reuse
         }
 
-        static bool teensy_streaming = false;
-        static int step_count = 1;
+
 
         if (serial_thread_running) {
             ImGui::SameLine();
-            if (teensy_streaming) ImGui::BeginDisabled();
+            if (teensy_streaming.load()) ImGui::BeginDisabled();
 
             //ImGui::SameLine();
             if (ImGui::Button("Send Config")) {
@@ -926,15 +1136,15 @@ int main(int argc, char* argv[]) {
                 log_teensy_message("GETCFG", true);
             }
 
-            if (teensy_streaming) ImGui::EndDisabled();
+            if (teensy_streaming.load()) ImGui::EndDisabled();
 
-            if (!teensy_streaming) {
+            if (!teensy_streaming.load()) {
                 if (ImGui::Button("Start Streaming")) {
                     setup_active_gpio_bits();
                     streaming_mode_enabled = true;
                     asio::write(port, asio::buffer("START\n", 6));
                     log_teensy_message("START", true);
-                    teensy_streaming = true;
+                    teensy_streaming.store(true);
                 }
 
                 ImGui::SameLine();
@@ -949,7 +1159,35 @@ int main(int argc, char* argv[]) {
                     std::string cmd = "STEP_" + std::to_string(step_count) + "\n";
                     asio::write(port, asio::buffer(cmd));
                     log_teensy_message(cmd, true);
+                    step_mode_enabled = true;  // 👈 Enable step mode
                 }
+
+                ImGui::Checkbox("Enable Streaming Breakpoint", &breakpoint_enabled);
+
+                ImGui::Text("Stop if packet matches:");
+                ImGui::SameLine();
+                ImGui::Text("Operation:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80);
+                ImGui::Combo("##op", &breakpoint_op, "Both\0READ\0WRITE\0");
+
+                ImGui::SameLine();
+                ImGui::Text("Chip:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100);
+                ImGui::Combo("##chip", &breakpoint_chip, "Both\0This chip\0Foreign\0");
+
+                ImGui::Text("Address (hex):");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100);
+                ImGui::InputText("##addr", breakpoint_address_hex, IM_ARRAYSIZE(breakpoint_address_hex), ImGuiInputTextFlags_CharsHexadecimal);
+
+                ImGui::SameLine();
+                ImGui::Text("Value (hex):");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100);
+                ImGui::InputText("##val", breakpoint_value_hex, IM_ARRAYSIZE(breakpoint_value_hex), ImGuiInputTextFlags_CharsHexadecimal);
+
 
                 if (ImGui::Button("Reset CPU")) {
                     std::string cmd = "RESET_CPU \n";
@@ -963,7 +1201,8 @@ int main(int argc, char* argv[]) {
                     streaming_mode_enabled = false; // Disable binary parsing
                     asio::write(port, asio::buffer("STOP\n", 5));
                     log_teensy_message("STOP", true);
-                    teensy_streaming = false;
+                    teensy_streaming.store(false);
+                    rebuild_memory_state_up_to(current_time_counter);
                 }
 
                 // Draw buffer backlog status dot
@@ -985,8 +1224,6 @@ int main(int argc, char* argv[]) {
 
             }
             ImGui::NewLine();
-
-            //ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "Teensy Status: %s", teensy_status_message.c_str());
 
             if (ImGui::Button("Save MT file")) {
                 char filename[MAX_PATH] = {};
@@ -1050,15 +1287,33 @@ int main(int argc, char* argv[]) {
         ImGui::NewLine();
         ImGui::Text("Transfer Rate: %.2f Mbps", mbps);
         ImGui::Text("Avg Time Between Ops: %.2f us", mean_us);
-        ImGui::Text("Packets: %llu | Reads: %llu | Writes: %llu", total_packets, read_count, write_count);
+        ImGui::Text("Packets: %llu | Reads: %llu | Writes: %llu | Foreign: %llu", total_packets, read_count, write_count, ignored_chip_packets);
+
 
         ImGui::Separator();
         ImGui::BeginChild("ScrollRegion", ImVec2(0, 400), true);
-        std::lock_guard<std::mutex> lock(packet_mutex);
-        for (const auto& pkt : packet_buffer) {
-            ImGui::Text("%llu | %s | 0x%X | 0x%X", pkt.counter, pkt.op.c_str(), pkt.address, pkt.value);
+
+        {
+            std::lock_guard<std::mutex> lock(packet_mutex);
+
+            std::vector<Packet> visible_packets;
+
+            // Collect packets up to current_time_counter
+            for (const auto& pkt : full_transaction_log) {
+                if (pkt.counter > current_time_counter) break;
+                visible_packets.push_back(pkt);
+            }
+
+            // Show only the last 10
+            size_t start = visible_packets.size() > 10 ? visible_packets.size() - 10 : 0;
+            for (size_t i = start; i < visible_packets.size(); ++i) {
+                const Packet& pkt = visible_packets[i];
+                ImGui::Text("%llu | %s | 0x%X | 0x%X", pkt.counter, pkt.op.c_str(), pkt.address, pkt.value);
+            }
         }
+
         ImGui::EndChild();
+
         ImGui::End();
 
         ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_Once);
@@ -1260,6 +1515,23 @@ int main(int argc, char* argv[]) {
 
 
         ImGui::Render();
+        if (breakpoint_pending_rebuild) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - breakpoint_trigger_timestamp
+                ).count();
+
+            if (elapsed >= 500) {
+                streaming_mode_enabled = false;
+                teensy_streaming.store(false);
+                current_time_counter.store(breakpoint_trigger_time);  // 👈 set the slider position
+                rebuild_memory_state_up_to(breakpoint_trigger_time);
+                std::cout << "[Breakpoint] Rebuilt memory at counter " << breakpoint_trigger_time << "\n";
+                user_overridden_slider = true; // 👈 prevent auto-follow after breakpoint
+                breakpoint_triggered = false;
+                breakpoint_pending_rebuild = false;
+            }
+        }
+
         SDL_RenderClear(renderer);
         ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
 

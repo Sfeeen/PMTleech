@@ -222,8 +222,12 @@ FASTRUN void loop() {
         if (config.oe_pin != (uint8_t)-1) {
           detachInterrupt(digitalPinToInterrupt(config.oe_pin));
         }
-      
+
+        uint64_t marker = 0xFFFFFFFFFFFFFFFFULL;
+        Serial.write((uint8_t*)&marker, 8);  // 👈 Send end-of-step marker packet
+
         digitalWriteFast(RUNNING_PIN, LOW);
+        delay(100);
         send_ack("STEPS DONE");
       } else {
         Serial.println("Unknown command:");
