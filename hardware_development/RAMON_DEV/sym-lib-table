@@ -1,0 +1,7 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "teensy")(type "Legacy")(uri "${KIPRJMOD}/Libraries/teensy_library-master/teensy.lib")(options "")(descr ""))
+  (lib (name "AT28C64-25PI")(type "KiCad")(uri "${KIPRJMOD}/Libraries/AT28C64-25PI/AT28C64-25PI.kicad_sym")(options "")(descr ""))
+  (lib (name "RAM_chips")(type "KiCad")(uri "${KIPRJMOD}/Libraries/RAM_chips.kicad_sym")(options "")(descr ""))
+  (lib (name "TXS0108EPWR")(type "KiCad")(uri "${KIPRJMOD}/Libraries/TXS0108EPWR/TXS0108EPWR.kicad_sym")(options "")(descr ""))
+)

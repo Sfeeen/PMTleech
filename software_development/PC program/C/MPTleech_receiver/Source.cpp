@@ -25,6 +25,7 @@
 #include <shlobj.h>     // SHCreateDirectoryEx
 #include <commdlg.h>    // GetSaveFileName, GetOpenFileName
 #include <bitset>
+#include <algorithm>
 
 
 
@@ -91,6 +92,8 @@ struct MemorySnapshot {
 std::vector<MemorySnapshot> memory_snapshots;
 constexpr size_t SNAPSHOT_INTERVAL = 30000;
 
+uint8_t read_memory_data[MEMORY_SIZE];
+
 int selected_pin_count = 28;  // Default pin count
 
 std::string teensy_ack_buffer;
@@ -140,7 +143,9 @@ const char* pin_options[] = {
 constexpr int TOTAL_PINS = 32;
 int selected_pin_function[TOTAL_PINS] = { 0 };  // All default to "NC"
 int selected_mode = 0; // 0 = interrupt, 1 = continuous
+int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
 int selected_freq_khz = 70; // default frequency in kHz (1 MHz)
+int xtal_freq_mhz = 16;
 
 
 
@@ -525,18 +530,14 @@ std::string detect_operation(uint64_t gpio64) { // 32 WE // 33 OE
     return "";
 }
 
-// Update rebuild_memory_state_up_to
 void rebuild_memory_state_up_to(uint64_t target_counter) {
     std::cout << "rebuilding" << std::endl;
-    //std::fill(std::begin(memory_written), std::end(memory_written), false);
-    //std::fill(std::begin(memory_data), std::end(memory_data), 0);
-    //std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
-    //std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
     recent_addresses.clear();
 
     // Find nearest snapshot
     size_t start_index = 0;
     uint64_t start_counter = 0;
+    bool snapshot_found = false;
 
     for (int i = static_cast<int>(memory_snapshots.size()) - 1; i >= 0; --i) {
         if (memory_snapshots[i].counter <= target_counter) {
@@ -545,13 +546,21 @@ void rebuild_memory_state_up_to(uint64_t target_counter) {
             memcpy(memory_written_by_write_op, memory_snapshots[i].written_by_write, MEMORY_SIZE);
             memcpy(memory_color, memory_snapshots[i].color, sizeof(memory_color));
             start_counter = memory_snapshots[i].counter;
+            snapshot_found = true;
             break;
         }
     }
 
-    recent_addresses.clear();
+    // ✅ If no snapshot was found (e.g., time 0), clear memory to initial state
+    if (!snapshot_found) {
+        std::fill(std::begin(memory_data), std::end(memory_data), 0);
+        std::fill(std::begin(memory_written), std::end(memory_written), false);
+        std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
+        std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
+        start_counter = 0;
+    }
 
-    std::lock_guard<std::mutex> lock(packet_mutex);  // 🔒 ADD THIS
+    std::lock_guard<std::mutex> lock(packet_mutex);
 
     for (const Packet& pkt : full_transaction_log) {
         if (pkt.counter <= start_counter) continue;
@@ -561,7 +570,6 @@ void rebuild_memory_state_up_to(uint64_t target_counter) {
         memory_data[pkt.address] = static_cast<uint8_t>(pkt.value & 0xFF);
         memory_written[pkt.address] = true;
 
-        
         if (pkt.foreign_chip) {
             memory_color[pkt.address] = MemColor::FOREIGN;
         }
@@ -579,10 +587,12 @@ void rebuild_memory_state_up_to(uint64_t target_counter) {
                 recent_addresses.erase(recent_addresses.begin());
         }
     }
+
     if (!recent_addresses.empty()) {
         scroll_to_recent_address = true;
     }
 }
+
 
 
 
@@ -684,7 +694,9 @@ void serial_thread_func() {
 
 
                 if (mt_log_file.is_open()) {
-                    mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << std::dec << "\n";
+                    mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << std::dec;
+                    if (pkt.foreign_chip) mt_log_file << " foreign";
+                    mt_log_file << "\n";
                 }
 
                 {
@@ -693,8 +705,7 @@ void serial_thread_func() {
                     full_transaction_log.push_back(pkt);
                     if (packet_buffer.size() > 10) packet_buffer.erase(packet_buffer.begin());
                 }
-
-                if (pkt.counter % SNAPSHOT_INTERVAL == 0) {
+                if (pkt.counter == 1 || pkt.counter % SNAPSHOT_INTERVAL == 0){
                     MemorySnapshot snap;
                     snap.counter = pkt.counter;
                     memcpy(snap.memory, memory_data, MEMORY_SIZE);
@@ -730,6 +741,30 @@ void serial_thread_func() {
                             teensy_running = false;
                             teensy_status_message = "Idle";
                         }
+                        // Parse 0xADDRESS: 0xVALUE format
+                        else if (line.rfind("0x", 0) == 0) {
+                            size_t colon = line.find(':');
+                            if (colon != std::string::npos) {
+                                std::string addr_str = line.substr(0, colon);
+                                std::string val_str = line.substr(colon + 1);
+                                addr_str.erase(std::remove_if(addr_str.begin(), addr_str.end(), ::isspace), addr_str.end());
+                                val_str.erase(std::remove_if(val_str.begin(), val_str.end(), ::isspace), val_str.end());
+
+                                try {
+                                    uint32_t address = std::stoul(addr_str, nullptr, 16);
+                                    uint32_t value = std::stoul(val_str, nullptr, 16);
+
+                                    if (address < MEMORY_SIZE) {
+                                        read_memory_data[address] = static_cast<uint8_t>(value & 0xFF);
+                                   
+                                    }
+                                }
+                                catch (...) {
+                                    std::cerr << "Failed to parse line: " << line << std::endl;
+                                }
+                            }
+                        }
+
                         else if (line.rfind("WE=", 0) == 0) {
                             teensy_status_message = line;
 
@@ -763,13 +798,132 @@ void serial_thread_func() {
 
 }
 
+void save_project(const std::string& project_name) {
+    std::string base_path = "projects/" + project_name;
+    CreateDirectoryA("projects", NULL);
+    CreateDirectoryA(base_path.c_str(), NULL);
+
+    // 1. Save chip configuration
+    json chip_json;
+    chip_json["chip_name"] = chip_name;
+    chip_json["pin_count"] = selected_pin_count;
+    for (int i = 0; i < TOTAL_PINS; ++i)
+        chip_json["pins"].push_back(selected_pin_function[i]);
+    std::ofstream chip_file(base_path + "/chip_config.json");
+    chip_file << chip_json.dump(4);
+
+    // 2. Save transaction log
+    std::ofstream mt_file(base_path + "/transactions.mt");
+    for (const auto& pkt : full_transaction_log) {
+        mt_file << pkt.op << " 0x" << std::hex << pkt.address
+            << " 0x" << pkt.value << std::dec;
+        if (pkt.foreign_chip) mt_file << " foreign";
+        mt_file << "\n";
+    }
+
+    // 3. Save memory slider position
+    json meta;
+    meta["slider_counter"] = current_time_counter.load();
+    std::ofstream meta_file(base_path + "/meta.json");
+    meta_file << meta.dump(4);
+}
+
+void load_project(const std::string& project_name) {
+    std::string base_path = "projects/" + project_name;
+
+    // 1. Load chip configuration
+    std::ifstream chip_file(base_path + "/chip_config.json");
+    if (chip_file) {
+        json j; chip_file >> j;
+        chip_name = j["chip_name"];
+        selected_pin_count = j["pin_count"];
+        auto pins = j["pins"];
+        for (size_t i = 0; i < pins.size() && i < TOTAL_PINS; ++i)
+            selected_pin_function[i] = pins[i];
+    }
+
+    // 2. Load transaction log
+    std::ifstream mt_file(base_path + "/transactions.mt");
+    full_transaction_log.clear();
+    packet_buffer.clear();
+    memory_snapshots.clear();
+    if (mt_file) {
+        std::string line;
+        uint64_t counter = 0;
+        while (std::getline(mt_file, line)) {
+            std::istringstream ss(line);
+            std::string op;
+            std::string addr_str, val_str;
+            std::string foreign_flag;
+            ss >> op >> addr_str >> val_str >> foreign_flag;
+
+            uint32_t addr = std::stoul(addr_str, nullptr, 16);
+            uint32_t val = std::stoul(val_str, nullptr, 16);
+            bool foreign = (foreign_flag == "foreign");
+
+            full_transaction_log.push_back({ ++counter, op, addr, val, foreign });
+
+            if (counter % SNAPSHOT_INTERVAL == 0 || counter == 1) {
+                MemorySnapshot snap;
+                snap.counter = counter;
+                memcpy(snap.memory, memory_data, MEMORY_SIZE);
+                memcpy(snap.written, memory_written, MEMORY_SIZE);
+                memcpy(snap.written_by_write, memory_written_by_write_op, MEMORY_SIZE);
+                memcpy(snap.color, memory_color, sizeof(memory_color));
+                memory_snapshots.push_back(snap);
+            }
+        }
+    }
+
+    // 2b. Recalculate counters
+    total_packets = full_transaction_log.size();
+    valid_packets = 0;
+    read_count = 0;
+    write_count = 0;
+    ignored_chip_packets = 0;
+
+    for (const auto& pkt : full_transaction_log) {
+        if (pkt.op == "READ") read_count++;
+        else if (pkt.op == "WRITE") write_count++;
+
+        if (pkt.op == "READ" || pkt.op == "WRITE") valid_packets++;
+        if (pkt.foreign_chip) ignored_chip_packets++;
+    }
+
+    // 3. Load slider position
+    std::ifstream meta_file(base_path + "/meta.json");
+    uint64_t slider_pos = 0;
+    if (meta_file) {
+        json j; meta_file >> j;
+        slider_pos = j["slider_counter"];
+    }
+
+    // 4. Rebuild memory and update UI state
+    current_time_counter.store(slider_pos);
+    rebuild_memory_state_up_to(slider_pos);
+    user_overridden_slider = true;
+}
+
+
+
 
 int main(int argc, char* argv[]) {
     SDL_Init(SDL_INIT_VIDEO);
     // Create or clear the temp file for memory transaction logging
     mt_log_file.open(temp_mt_log_filename, std::ios::out | std::ios::trunc);
+    std::fill(std::begin(read_memory_data), std::end(read_memory_data), 0xFF);
 
-    SDL_Window* window = SDL_CreateWindow("Teensy Serial Monitor", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 1400, 600, SDL_WINDOW_SHOWN);
+    SDL_Window* window = SDL_CreateWindow(
+        "Teensy Serial Monitor",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        1400, 600,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE  // 👈 Add this
+    );
+
+    SDL_MaximizeWindow(window);  // 👌 Works properly with resizable flag
+
+
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
 
     IMGUI_CHECKVERSION();
@@ -822,8 +976,104 @@ int main(int argc, char* argv[]) {
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowSize(ImVec2(950, 600), ImGuiCond_Once);
+        static bool trigger_save_popup = false;
+        static bool trigger_load_popup = false;
+
+        if (ImGui::BeginMainMenuBar()) {
+            if (ImGui::BeginMenu("Project")) {
+                if (ImGui::MenuItem("Save Project")) {
+                    std::cout << "open" << "\n";
+                    trigger_save_popup = true;
+                    //ImGui::OpenPopup("SaveProjectPopup");
+                }
+                if (ImGui::MenuItem("Load Project")) {
+                    std::cout << "open" << "\n";
+                    trigger_load_popup = true;
+                    ImGui::OpenPopup("LoadProjectPopup");
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMainMenuBar();
+        }
+
+        if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) || trigger_save_popup) {
+            ImGui::OpenPopup("SaveProjectPopup");
+            trigger_save_popup = false;
+        }
+        if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) || trigger_load_popup) {
+            ImGui::OpenPopup("LoadProjectPopup");
+            trigger_load_popup = false;
+        }
+
+
+        // Save Project popup
+        static char project_name_input[64] = "NewProject";
+        if (ImGui::BeginPopupModal("SaveProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+            // Handle ESC key
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                ImGui::CloseCurrentPopup();
+            }
+
+            ImGui::InputText("Project Name", project_name_input, IM_ARRAYSIZE(project_name_input));
+            if (ImGui::Button("Save")) {
+                save_project(project_name_input);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(650, 0), ImGuiCond_Appearing);  // width = 250, height = auto
+        if (ImGui::BeginPopupModal("LoadProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+            static std::vector<std::string> project_dirs;
+            static bool need_reload = true;
+
+            // Handle ESC key
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                // Your cancel logic here (e.g. clear state, reset vars)
+                need_reload = true;
+                ImGui::CloseCurrentPopup();
+            }
+
+            if (need_reload) {
+                project_dirs.clear();
+                WIN32_FIND_DATAA ffd;
+                HANDLE hFind = FindFirstFileA("projects\\*", &ffd);
+                if (hFind != INVALID_HANDLE_VALUE) {
+                    do {
+                        if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                            strcmp(ffd.cFileName, ".") != 0 &&
+                            strcmp(ffd.cFileName, "..") != 0) {
+                            project_dirs.push_back(ffd.cFileName);
+                        }
+                    } while (FindNextFileA(hFind, &ffd));
+                    FindClose(hFind);
+                }
+                need_reload = false;
+            }
+
+            for (const std::string& dir : project_dirs) {
+                if (ImGui::Selectable(dir.c_str())) {
+                    load_project(dir);
+                    ImGui::CloseCurrentPopup();
+                    need_reload = true;
+                }
+            }
+
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+                need_reload = true;
+            }
+            ImGui::EndPopup();
+        }
+
+
+
+        ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
         ImGui::Begin("Memory view");
+
+
 
         if (ImGui::Button("Save bin file")) {
             strcpy_s(unknown_byte_input, "FF");  // Default fill for unknown
@@ -832,6 +1082,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (ImGui::BeginPopupModal("Save Memory to Bin", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+
             ImGui::Text("Enter hex value to replace unknown (??) bytes:");
             ImGui::InputText("Hex byte", unknown_byte_input, IM_ARRAYSIZE(unknown_byte_input), ImGuiInputTextFlags_CharsHexadecimal);
 
@@ -1028,7 +1279,7 @@ int main(int argc, char* argv[]) {
         ImGui::End();
 
 
-        ImGui::SetNextWindowSize(ImVec2(500, 500), ImGuiCond_Once);
+        ImGui::SetNextWindowSize(ImVec2(500, 700), ImGuiCond_Once);
         ImGui::Begin("Packet Monitor");
 
         if (ImGui::BeginCombo("Serial Port", port_labels.empty() ? "" : port_labels[selected_port_index].c_str())) {
@@ -1094,7 +1345,11 @@ int main(int argc, char* argv[]) {
 
             //ImGui::SameLine();
             if (ImGui::Button("Send Config")) {
-                int we_teensy = -1, oe_teensy = -1;
+                int we_teensy = -1, oe_teensy = -1, cs_teensy = -1;
+
+
+                std::vector<std::pair<std::string, int>> address_pins;
+                std::vector<std::pair<std::string, int>> data_pins;
 
                 for (int i = 0; i < TOTAL_PINS; ++i) {
                     int pin_idx = selected_pin_function[i];
@@ -1106,19 +1361,52 @@ int main(int argc, char* argv[]) {
                     if (selected_pin_count == 30) chip_pin -= 1;
                     else if (selected_pin_count == 28) chip_pin -= 2;
 
-                    if (label == "/WE") we_teensy = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
-                    if (label == "/OE") oe_teensy = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
+                    int teensy_pin = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
+
+                    if (label == "/WE") we_teensy = teensy_pin;
+                    else if (label == "/OE") oe_teensy = teensy_pin;
+                    else if (label == "/CS") cs_teensy = teensy_pin;
+                    else if (label.rfind("A", 0) == 0) address_pins.emplace_back(label, teensy_pin);
+                    else if (label.rfind("D", 0) == 0) data_pins.emplace_back(label, teensy_pin);
                 }
 
                 if (we_teensy != -1 || oe_teensy != -1) {
                     int mode = selected_mode;
                     int freq = selected_freq_khz * 1000;
+                    int xtal_freq = xtal_freq_mhz * 1000000;
+
+                    // Sort A and D pins by label (A1 < A2 < A3, D1 < D2 < D3 ...)
+                    std::sort(address_pins.begin(), address_pins.end(), [](const auto& a, const auto& b) {
+                        return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
+                        });
+
+                    std::sort(data_pins.begin(), data_pins.end(), [](const auto& a, const auto& b) {
+                        return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
+                        });
+
+                    std::string addrs = "ADDRS=";
+                    for (size_t i = 0; i < address_pins.size(); ++i) {
+                        if (i > 0) addrs += ",";
+                        addrs += std::to_string(address_pins[i].second);
+                    }
+
+                    std::string datas = "DATAS=";
+                    for (size_t i = 0; i < data_pins.size(); ++i) {
+                        if (i > 0) datas += ",";
+                        datas += std::to_string(data_pins[i].second);
+                    }
 
                     std::string config_cmd = "CFG WE=" + std::to_string(we_teensy) +
                         " OE=" + std::to_string(oe_teensy) +
+                        " CS=" + std::to_string(cs_teensy) +
                         " MODE=" + std::to_string(mode) +
                         " FREQ=" + std::to_string(freq) +
+                        " XTAL=" + std::to_string(xtal_freq) +
+                        " IDLE=" + std::to_string(cpu_idle_behavior) +
+                        " " + addrs +
+                        " " + datas +
                         " NAME=" + chip_name + "\n";
+
 
                     asio::write(port, asio::buffer(config_cmd));
                     log_teensy_message(config_cmd, true);
@@ -1126,8 +1414,8 @@ int main(int argc, char* argv[]) {
                 else {
                     std::cerr << "Missing both /WE and /OE pin assignments!\n";
                 }
-
             }
+
 
 
             ImGui::SameLine();
@@ -1251,17 +1539,39 @@ int main(int argc, char* argv[]) {
                 {
                     std::lock_guard<std::mutex> lock(packet_mutex);
                     packet_buffer.clear();
+                    full_transaction_log.clear();
                 }
+
+                // Clear memory contents and flags
+                std::fill(std::begin(memory_data), std::end(memory_data), 0);
+                std::fill(std::begin(memory_written), std::end(memory_written), false);
+                std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
+                std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
+
+                // Clear snapshots and recent addresses
+                memory_snapshots.clear();
+                recent_addresses.clear();
+                scroll_to_recent_address = false;
+
+                // Reset counters
+                total_bytes = 0;
                 total_packets = 0;
                 valid_packets = 0;
                 read_count = 0;
                 write_count = 0;
-                total_bytes = 0;
-                for (size_t i = 0; i < MEMORY_SIZE; ++i) {
-                    memory_written[i] = false;
-                    memory_data[i] = 0;
+                ignored_chip_packets = 0;
+
+                // Reset time travel state
+                current_time_counter.store(0);
+                user_overridden_slider = false;
+
+                // Reset temp MT log file
+                if (mt_log_file.is_open()) {
+                    mt_log_file.close();
+                    mt_log_file.open(temp_mt_log_filename, std::ios::out | std::ios::trunc);
                 }
             }
+
 
         }
 
@@ -1287,34 +1597,207 @@ int main(int argc, char* argv[]) {
         ImGui::NewLine();
         ImGui::Text("Transfer Rate: %.2f Mbps", mbps);
         ImGui::Text("Avg Time Between Ops: %.2f us", mean_us);
-        ImGui::Text("Packets: %llu | Reads: %llu | Writes: %llu | Foreign: %llu", total_packets, read_count, write_count, ignored_chip_packets);
+        // Line 1: Total packets
+        ImGui::Text("Total packets %llu : %llu valid | %llu invalid",
+            total_packets, valid_packets, total_packets - valid_packets);
 
+        // Line 2: Valid packets with green "Writes"
+        ImGui::Text("Valid packets %llu :", valid_packets);
+        ImGui::SameLine();
+        ImGui::Text("Reads %llu |", read_count);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.3f, 1.0f));  // Green
+        ImGui::Text("Writes %llu", write_count);
+        ImGui::PopStyleColor();
+
+        // Line 3: Local vs Foreign with purple "Foreign"
+        ImGui::Text("Local packets: %llu |", valid_packets - ignored_chip_packets);
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.4f, 1.0f, 1.0f));  // Purple
+        ImGui::Text("Foreign packets: %llu", ignored_chip_packets);
+        ImGui::PopStyleColor();
 
         ImGui::Separator();
-        ImGui::BeginChild("ScrollRegion", ImVec2(0, 400), true);
+        ImGui::BeginChild("ScrollRegion", ImVec2(0, 200), true);
 
-        {
-            std::lock_guard<std::mutex> lock(packet_mutex);
+        static const ImVec4 red_shades[10] = {
+            ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+            ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+            ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
+            ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+        };
 
-            std::vector<Packet> visible_packets;
+        std::lock_guard<std::mutex> lock(packet_mutex);
 
-            // Collect packets up to current_time_counter
-            for (const auto& pkt : full_transaction_log) {
-                if (pkt.counter > current_time_counter) break;
-                visible_packets.push_back(pkt);
+        size_t total = full_transaction_log.size();
+        int shown = 0;
+        for (int i = static_cast<int>(total) - 1; i >= 0 && shown < 10; --i) {
+            if (full_transaction_log[i].counter <= current_time_counter) {
+                const Packet& pkt = full_transaction_log[i];
+
+                // Determine red intensity based on recent_addresses
+                int recent_index = -1;
+                for (int j = 0; j < static_cast<int>(recent_addresses.size()); ++j) {
+                    if (recent_addresses[j] == pkt.address) {
+                        recent_index = j;
+                        break;
+                    }
+                }
+
+                // Format base line
+                char line[128];
+                snprintf(line, sizeof(line), "%llu | %s | 0x%X | 0x%X%s",
+                    pkt.counter,
+                    pkt.op.c_str(),
+                    pkt.address,
+                    pkt.value,
+                    pkt.foreign_chip ? " | foreign" : ""
+                );
+
+                if (recent_index != -1) {
+                    ImVec4 color = red_shades[9 - std::min(recent_index, 9)];
+                    ImGui::TextColored(color, "%s", line);
+                }
+                else {
+                    ImGui::Text("%s", line);
+                }
+
+                ++shown;
+            }
+        }
+
+
+        ImGui::EndChild();
+        ImGui::End();
+
+        ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
+        ImGui::Begin("Read/Write Memory");
+
+        // Optional: Add Write/Modify UI later here
+        if (ImGui::Button("Read chip memory")) {
+            asio::write(port, asio::buffer("READALL\n", 8));
+            log_teensy_message("READALL", true);
+            std::fill(std::begin(read_memory_data), std::end(read_memory_data), 0xFF);
+        }
+
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Write chip memory")) {
+            try {
+                // 1. Send command
+                asio::write(port, asio::buffer("WRITEALL\n", 9));
+                log_teensy_message("WRITEALL", true);
+
+                // 3. Send raw memory data
+                asio::write(port, asio::buffer(read_memory_data, MEMORY_SIZE));
+
+                // 4. Notify done
+                asio::write(port, asio::buffer("WRITEALL DONE\n", 14));
+                log_teensy_message("WRITEALL DONE", true);
+
+            }
+            catch (const std::exception& e) {
+                log_teensy_message(std::string("Write failed: ") + e.what(), false);
+            }
+        }
+
+
+        //ImGui::NewLine();
+        if (ImGui::Button("Save Readout to Bin")) {
+            char filename[MAX_PATH] = {};
+            strcpy_s(filename, "chip_readout.bin");
+
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = NULL;
+            ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
+            ofn.lpstrFile = filename;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrInitialDir = ".";
+            ofn.lpstrTitle = "Save Readout";
+            ofn.Flags = OFN_OVERWRITEPROMPT;
+            ofn.lpstrDefExt = "bin";
+
+            if (GetSaveFileNameA(&ofn)) {
+                std::ofstream file(ofn.lpstrFile, std::ios::binary);
+                if (file) {
+                    file.write(reinterpret_cast<const char*>(read_memory_data), MEMORY_SIZE);
+                    file.close();
+                }
+            }
+        }
+
+
+        static int edit_byte_addr = -1;
+        static char hex_input[5] = "";
+        bool open_edit_popup = false;
+
+        // Load File Button
+        if (ImGui::Button("Load file into memory")) {
+            char filename[MAX_PATH] = {};
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
+            ofn.lpstrFile = filename;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrTitle = "Select a file to load";
+            ofn.Flags = OFN_FILEMUSTEXIST;
+
+            if (GetOpenFileNameA(&ofn)) {
+                std::ifstream in(filename, std::ios::binary);
+                if (in) {
+                    std::vector<uint8_t> buffer(std::istreambuf_iterator<char>(in), {});
+                    size_t len = std::min(buffer.size(), static_cast<size_t>(MEMORY_SIZE));
+                    std::copy(buffer.begin(), buffer.begin() + len, read_memory_data);
+                }
+            }
+        }
+
+
+        ImGui::BeginChild("ReadMemoryHexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+        // Header
+        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Offset(h)");
+        ImGui::SameLine(70);
+        for (int col = 0; col < 16; ++col) {
+            char col_label[4];
+            sprintf_s(col_label, "%02X", col);
+            ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%s", col_label);
+            if (col != 15) ImGui::SameLine();
+        }
+
+        // Layout calculations
+        ImVec2 cell_size = ImVec2(ImGui::CalcTextSize("FF").x + 2.0f, ImGui::GetTextLineHeight());
+        float rw_ascii_start_x = 70 + 16 * (cell_size.x + 6.0f) + 25;
+
+        // Memory viewer rows
+        for (size_t row = 0; row < MEMORY_SIZE; row += 16) {
+            ImGui::Text("%08X", static_cast<unsigned int>(row));
+            ImGui::SameLine(70);
+
+            for (int col = 0; col < 16; ++col) {
+                size_t addr = row + col;
+                char label[4];
+                sprintf_s(label, "%02X", read_memory_data[addr]);
+
+                ImGui::Text("%s", label);
+                if (col != 15) ImGui::SameLine();
             }
 
-            // Show only the last 10
-            size_t start = visible_packets.size() > 10 ? visible_packets.size() - 10 : 0;
-            for (size_t i = start; i < visible_packets.size(); ++i) {
-                const Packet& pkt = visible_packets[i];
-                ImGui::Text("%llu | %s | 0x%X | 0x%X", pkt.counter, pkt.op.c_str(), pkt.address, pkt.value);
+            // ASCII view
+            ImGui::SameLine(rw_ascii_start_x);
+            for (int col = 0; col < 16; ++col) {
+                size_t addr = row + col;
+                char c = (read_memory_data[addr] >= 32 && read_memory_data[addr] <= 126) ? read_memory_data[addr] : '.';
+                ImGui::Text("%c", c);
+                if (col != 15) ImGui::SameLine();
             }
         }
 
         ImGui::EndChild();
-
         ImGui::End();
+
 
         ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_Once);
         ImGui::Begin("Chip Configuration");
@@ -1325,13 +1808,24 @@ int main(int argc, char* argv[]) {
         ImGui::RadioButton("32 pins", &selected_pin_count, 32);
         ImGui::Separator();
 
+        // New Input: Onboard XTAL frequency in MHz
+        ImGui::Text("Onboard XTAL Frequency:");
+        ImGui::InputInt("MHz", &xtal_freq_mhz);
+        if (xtal_freq_mhz < 0.1f) xtal_freq_mhz = 0.1f;
+
+        // New Option: What CPU should do if not streaming
+        static int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
+        ImGui::Text("If not streaming CPU should:");
+        ImGui::RadioButton("not run (0 Hz clk)", &cpu_idle_behavior, 0); ImGui::SameLine();
+        ImGui::RadioButton("run at XTAL frequency", &cpu_idle_behavior, 1);
+
+        ImGui::Text("Streaming Frequency (max. 70kHz) :");
+        ImGui::InputInt("kHz", &selected_freq_khz);
+        if (selected_freq_khz < 1) selected_freq_khz = 1;
+
         ImGui::Text("Capture Mode:");
         ImGui::RadioButton("Interrupt", &selected_mode, 0); ImGui::SameLine();
         ImGui::RadioButton("Continuous", &selected_mode, 1);
-
-        ImGui::Text("External Clock Frequency (1khz - 16Mhz) :");
-        ImGui::InputInt("kHz", &selected_freq_khz);
-        if (selected_freq_khz < 1) selected_freq_khz = 1;
 
         if (ImGui::Button("Save Config")) save_config_to_json();
         ImGui::SameLine();

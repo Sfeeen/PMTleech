@@ -1,0 +1,7 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "teensy.pretty-master")(type "KiCad")(uri "${KIPRJMOD}/Libraries/teensy.pretty-master")(options "")(descr ""))
+  (lib (name "clockwise_connectors")(type "KiCad")(uri "${KIPRJMOD}/Libraries/clockwise_connectors.pretty")(options "")(descr ""))
+  (lib (name "images")(type "KiCad")(uri "${KIPRJMOD}/Libraries/images.pretty")(options "")(descr ""))
+  (lib (name "bigger_dip_socket_holes")(type "KiCad")(uri "${KIPRJMOD}/bigger_dip_socket_holes.pretty")(options "")(descr ""))
+)

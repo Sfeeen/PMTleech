@@ -24,10 +24,18 @@ enum State : uint8_t {
 struct Config {
   uint8_t we_pin;
   uint8_t oe_pin;
+  uint8_t cs_pin; 
   RunMode mode;
   uint32_t freq;
+  uint32_t xtal_freq;
+  uint8_t idle_behavior; // 0 = halt, 1 = run at XTAL
   char chip_name[30];
+  uint8_t address_pins[24]; // A1–A24 max
+  uint8_t address_count;
+  uint8_t data_pins[16];    // D1–D16 max
+  uint8_t data_count;
 };
+
 
 Config config;
 State state = IDLE;
@@ -66,15 +74,173 @@ void load_config_from_eeprom() {
   if (EEPROM.read(EEPROM_MAGIC_ADDR) == EEPROM_MAGIC) {
     EEPROM.get(EEPROM_CONFIG_ADDR, config);
   } else {
-    // Default values
+
+    Serial.println("Using default values!");
+
     config.we_pin = 10;
     config.oe_pin = 12;
+    config.cs_pin = 11;
     config.mode = INTERRUPT_MODE;
-    config.freq = 500000;
+    config.freq = 70000;
+    config.xtal_freq = 16000000;
+    config.idle_behavior = 0;
     strncpy(config.chip_name, "AT28C64B", sizeof(config.chip_name) - 1);
     config.chip_name[sizeof(config.chip_name) - 1] = '\0';
+
+    uint8_t default_addr[] = {0, 24, 25, 19, 18, 14, 15, 40, 41, 17, 16, 22, 23};
+    config.address_count = sizeof(default_addr);
+    memcpy(config.address_pins, default_addr, config.address_count);
+
+    uint8_t default_data[] = {1, 35, 34, 8, 32, 9, 6, 13};
+    config.data_count = sizeof(default_data);
+    memcpy(config.data_pins, default_data, config.data_count);
   }
 }
+
+void write_memory_from_serial() {
+  uint32_t max_address = (1UL << config.address_count);
+  if (max_address > MEMORY_SIZE) max_address = MEMORY_SIZE;
+
+  // Wait until we have enough bytes
+  while (Serial.available() < max_address) {
+    delay(1);  // Wait a bit
+  }
+
+  // Read data into buffer
+  static uint8_t buffer[MEMORY_SIZE];
+  Serial.readBytes(buffer, max_address);
+
+  // Now wait for confirmation line
+  String end_marker;
+  while (true) {
+    if (Serial.available()) {
+      char ch = Serial.read();
+      if (ch == '\n' || ch == '\r') {
+        end_marker.trim();
+        if (end_marker == "WRITEALL DONE") break;
+        else end_marker = "";
+      } else {
+        end_marker += ch;
+      }
+    }
+  }
+
+  Serial.printf("Writing %lu bytes to chip...\n", max_address);
+
+  // Setup address & data pins
+  for (uint8_t i = 0; i < config.address_count; ++i)
+    pinMode(config.address_pins[i], OUTPUT);
+
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], OUTPUT);
+
+  pinMode(config.cs_pin, OUTPUT);
+  pinMode(config.oe_pin, OUTPUT);
+  pinMode(config.we_pin, OUTPUT);
+
+  digitalWriteFast(config.cs_pin, LOW);
+  digitalWriteFast(config.oe_pin, HIGH);  // Disable output
+  digitalWriteFast(config.we_pin, HIGH);  // Write is inactive when HIGH
+
+  for (uint32_t addr = 0; addr < max_address; ++addr) {
+    uint8_t value = buffer[addr];
+
+    // Set address lines
+    for (uint8_t i = 0; i < config.address_count; ++i) {
+      digitalWriteFast(config.address_pins[i], (addr >> i) & 1);
+    }
+
+    // Set data lines
+    for (uint8_t i = 0; i < config.data_count; ++i) {
+      digitalWriteFast(config.data_pins[i], (value >> i) & 1);
+    }
+
+    // Pulse WE low
+    digitalWriteFast(config.we_pin, LOW);
+    delayMicroseconds(10);  // adjust as needed
+    digitalWriteFast(config.we_pin, HIGH);
+
+    delayMicroseconds(10);  // chip write delay
+  }
+
+  // Disable chip
+  digitalWriteFast(config.cs_pin, HIGH);
+  digitalWriteFast(config.oe_pin, HIGH);
+  digitalWriteFast(config.we_pin, HIGH);
+
+  // 🧹 Reset all previously output pins to input
+  for (uint8_t i = 0; i < config.address_count; ++i)
+    pinMode(config.address_pins[i], INPUT);
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], INPUT);
+
+  pinMode(config.cs_pin, INPUT);
+  pinMode(config.oe_pin, INPUT);
+  pinMode(config.we_pin, INPUT);
+
+  Serial.println("WRITE DONE");
+}
+
+
+void read_memory() {
+  uint32_t max_address = (1UL << config.address_count);
+
+  Serial.printf("Reading 0x%lX addresses...\n", max_address);
+
+  // --- Set all address pins as OUTPUT
+  for (uint8_t i = 0; i < config.address_count; ++i) {
+    pinMode(config.address_pins[i], OUTPUT);
+  }
+
+  // --- Set all data pins as INPUT
+  for (uint8_t i = 0; i < config.data_count; ++i) {
+    pinMode(config.data_pins[i], INPUT);
+  }
+
+  // --- Configure chip control signals
+  pinMode(config.cs_pin, OUTPUT);
+  pinMode(config.oe_pin, OUTPUT);
+  digitalWriteFast(config.cs_pin, LOW);  // Enable chip
+  digitalWriteFast(config.oe_pin, LOW);  // Enable output
+
+  // --- Loop over address space
+  for (uint32_t addr = 0; addr < max_address; ++addr) {
+    // Set address lines
+    for (uint8_t i = 0; i < config.address_count; ++i) {
+      digitalWriteFast(config.address_pins[i], (addr >> i) & 1);
+    }
+
+    delayMicroseconds(50);  // settling time
+
+    // Read data byte
+    uint8_t data = 0;
+    for (uint8_t i = 0; i < config.data_count; ++i) {
+      if (digitalReadFast(config.data_pins[i])) {
+        data |= (1 << i);
+      }
+    }
+
+    Serial.printf("0x%05lX: 0x%02X\n", addr, data);
+  }
+
+  // Disable chip
+  digitalWriteFast(config.cs_pin, HIGH);
+  digitalWriteFast(config.oe_pin, HIGH);
+  digitalWriteFast(config.we_pin, HIGH);
+
+  // 🧹 Reset all previously output pins to input
+  for (uint8_t i = 0; i < config.address_count; ++i)
+    pinMode(config.address_pins[i], INPUT);
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], INPUT);
+
+  pinMode(config.cs_pin, INPUT);
+  pinMode(config.oe_pin, INPUT);
+  pinMode(config.we_pin, INPUT);
+
+  Serial.println("READ DONE");
+}
+
 
 
 void send_ack(const char* msg) {
@@ -111,15 +277,17 @@ void enter_idle_mode() {
     if (config.oe_pin != (uint8_t)-1) {
       detachInterrupt(digitalPinToInterrupt(config.oe_pin));
     }
-  } else {
-    //sample_timer.end();
   }
 
-
-  analogWrite(EXT_CLK_PIN, 0);      // Optional: reduces duty to 0%
-  pinMode(EXT_CLK_PIN, OUTPUT);     // Force pin as GPIO output
-  digitalWriteFast(EXT_CLK_PIN, LOW); // Drive LOW
-
+  if (config.idle_behavior == 1 && config.xtal_freq > 0) {
+    // ✳️ XTAL mode — run EXT_CLK at specified xtal_freq
+    analogWriteFrequency(EXT_CLK_PIN, config.xtal_freq);
+    analogWrite(EXT_CLK_PIN, 128); // 50% duty
+  } else {
+    // ❌ HALT mode — disable clock
+    analogWrite(EXT_CLK_PIN, 0);          // Optional: reduces duty to 0%
+    digitalWriteFast(EXT_CLK_PIN, LOW);   // Drive LOW
+  }
 
   digitalWrite(RUNNING_PIN, LOW);
   state = IDLE;
@@ -133,12 +301,52 @@ void parse_config_line(const String& line) {
   int oe = line.indexOf("OE=");
   int mode = line.indexOf("MODE=");
   int freq = line.indexOf("FREQ=");
+  int xtal = line.indexOf("XTAL=");
+  int idle = line.indexOf("IDLE=");
+  int addrs = line.indexOf("ADDRS=");
+  int datas = line.indexOf("DATAS=");
   int name = line.indexOf("NAME=");
+  int cs = line.indexOf("CS=");
 
-  if (we != -1) config.we_pin = line.substring(we + 3).toInt();
-  if (oe != -1) config.oe_pin = line.substring(oe + 3).toInt();
-  if (mode != -1) config.mode = (RunMode)line.substring(mode + 5).toInt();
-  if (freq != -1) config.freq = line.substring(freq + 5).toInt();
+
+  if (we != -1) config.we_pin = line.substring(we + 3, line.indexOf(' ', we + 3)).toInt();
+  if (oe != -1) config.oe_pin = line.substring(oe + 3, line.indexOf(' ', oe + 3)).toInt();
+  if (mode != -1) config.mode = (RunMode)line.substring(mode + 5, line.indexOf(' ', mode + 5)).toInt();
+  if (freq != -1) config.freq = line.substring(freq + 5, line.indexOf(' ', freq + 5)).toInt();
+  if (xtal != -1) config.xtal_freq = line.substring(xtal + 5, line.indexOf(' ', xtal + 5)).toInt();
+  if (idle != -1) config.idle_behavior = line.substring(idle + 5, line.indexOf(' ', idle + 5)).toInt();
+  if (cs != -1) config.cs_pin = line.substring(cs + 3, line.indexOf(' ', cs + 3)).toInt();
+
+
+  // Parse address pins
+  if (addrs != -1) {
+    String pinlist = line.substring(addrs + 6, line.indexOf(' ', addrs + 6));
+    config.address_count = 0;
+    int start = 0;
+    while (start < pinlist.length()) {
+      int comma = pinlist.indexOf(',', start);
+      if (comma == -1) comma = pinlist.length();
+      config.address_pins[config.address_count++] = pinlist.substring(start, comma).toInt();
+      start = comma + 1;
+      if (config.address_count >= sizeof(config.address_pins)) break;
+    }
+  }
+
+  // Parse data pins
+  if (datas != -1) {
+    String pinlist = line.substring(datas + 6, line.indexOf(' ', datas + 6));
+    config.data_count = 0;
+    int start = 0;
+    while (start < pinlist.length()) {
+      int comma = pinlist.indexOf(',', start);
+      if (comma == -1) comma = pinlist.length();
+      config.data_pins[config.data_count++] = pinlist.substring(start, comma).toInt();
+      start = comma + 1;
+      if (config.data_count >= sizeof(config.data_pins)) break;
+    }
+  }
+
+  // Name comes last
   if (name != -1) {
     String n = line.substring(name + 5);
     n.trim();
@@ -151,19 +359,35 @@ void parse_config_line(const String& line) {
 }
 
 void handle_get_config() {
-  char buf[128];
-  snprintf(buf, sizeof(buf), "WE=%d OE=%d MODE=%d FREQ=%lu NAME=%s",
-           config.we_pin, config.oe_pin, (int)config.mode, config.freq, config.chip_name);
-  send_ack(buf);
+
+  Serial.printf("WE=%d OE=%d CS=%d MODE=%d FREQ=%lu XTAL=%lu IDLE=%d ",
+              config.we_pin, config.oe_pin, config.cs_pin, config.mode,
+              config.freq, config.xtal_freq, config.idle_behavior);
+
+
+  Serial.print("ADDRS=");
+  for (int i = 0; i < config.address_count; ++i) {
+    Serial.print(config.address_pins[i]);
+    if (i != config.address_count - 1) Serial.print(",");
+  }
+  Serial.print(" DATAS=");
+  for (int i = 0; i < config.data_count; ++i) {
+    Serial.print(config.data_pins[i]);
+    if (i != config.data_count - 1) Serial.print(",");
+  }
+
+  Serial.print(" NAME=");
+  Serial.println(config.chip_name);
 }
+
 
 void setup() {
   Serial.begin(2000000);
   pinMode(RUNNING_PIN, OUTPUT);
   digitalWrite(RUNNING_PIN, LOW);
   pinMode(EXT_CLK_PIN, OUTPUT);
-  digitalWrite(EXT_CLK_PIN, LOW);
   load_config_from_eeprom();
+  enter_idle_mode();
   Serial.println("BOOTED");
 }
 
@@ -229,6 +453,11 @@ FASTRUN void loop() {
         digitalWriteFast(RUNNING_PIN, LOW);
         delay(100);
         send_ack("STEPS DONE");
+      } else if (serial_buffer == "READALL"  && state == IDLE) {
+          read_memory();
+          send_ack("READ DONE");
+      } else if (serial_buffer == "WRITEALL" && state == IDLE) {
+        write_memory_from_serial();
       } else {
         Serial.println("Unknown command:");
         Serial.println(serial_buffer);

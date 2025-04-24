@@ -1,0 +1,9 @@
+"Id";"Designator";"Footprint";"Quantity";"Designation";"Supplier and ref";
+1;"R30,R99,R98,R97,R96,R95,R43,R42,R41,R40,R39,R38,R37,R36,R35,R34,R32,R31,R29,R28,R27,R26,R25,R24,R23,R22,R21,R20,R19,R18,R17,R16,R15,R14,R13,R12,R11,R10,R9,R8,R7,R6,R5,R4,R3,R2,R1";"R_0603_1608Metric";47;"330R";;;
+2;"Q2";"TSOT-23";1;"Q_PMOS_GSD";;;
+3;"J5";"DIP-32_W15.24mm_Socket_LongPads";1;"Conn_02x16_Counter_Clockwise";;;
+4;"J3";"PinHeader_1x07_P2.54mm_Vertical";1;"Conn_01x07";;;
+5;"J1,J2";"PinHeader_1x03_P2.54mm_Vertical";2;"Conn_01x03";;;
+6;"D3,D1,D2,D33,D32,D34,D35,D31";"LED_0805_2012Metric";8;"LED";;;
+7;"U1";"Teensy41";1;"Teensy4.1";;;
+8;"J8";"PinHeader_2x16_P2.54mm_Vertical_clockwise";1;"Conn_02x16_Counter_Clockwise";;;
