@@ -169,10 +169,6 @@ int cs_bit_pos = -1;
 
 
 
-
-
-
-
 // Helper function to map chip pin number to Teensy pin based on chip size
 int chip_pinnumber_to_teensy_pin(int chip_pin, int pin_count) {
     // Adjust pin index for centered layouts
@@ -361,9 +357,6 @@ std::string get_chip_configuration_status() {
     return status;
 }
 
-
-
-
 void log_teensy_message(const std::string& line, bool from_pc = false) {
     std::lock_guard<std::mutex> lock(teensy_log_mutex);
     std::string tag = from_pc ? "[PC] " : "[Teensy] ";
@@ -372,6 +365,23 @@ void log_teensy_message(const std::string& line, bool from_pc = false) {
     if (teensy_log_lines.size() > 500)
         teensy_log_lines.erase(teensy_log_lines.begin());
 }
+
+void teensy_write(const std::string& payload) {
+    std::ostringstream oss;
+
+    // Header
+    oss << '<';
+    oss << std::setw(4) << std::setfill('0') << std::hex << payload.size();
+
+    // Payload
+    oss << payload;
+
+    std::string formatted = oss.str();
+
+    asio::write(port, asio::buffer(formatted));
+    log_teensy_message(formatted, true);
+}
+
 
 
 void load_chip_image(SDL_Renderer* renderer) {
@@ -593,105 +603,89 @@ void rebuild_memory_state_up_to(uint64_t target_counter) {
     }
 }
 
-
-
-
 void serial_thread_func() {
-    // Use global active_address_bits and active_data_bits set by setup_active_gpio_bits()
-
-    #ifdef _WIN32
-    // Boost thread priority on Windows
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
-    #endif
-
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
 
     uint64_t counter = 0;
     std::vector<uint8_t> buffer(8192);
-
     asio::error_code ec;
 
     while (running) {
         size_t bytes_read = port.read_some(asio::buffer(buffer), ec);
         if (ec) break;
-
         total_bytes += bytes_read;
 
-        if (streaming_mode_enabled || step_mode_enabled) {
-            // 🔁 PACKET MODE
-            if (bytes_read < 8) continue;
-            int packet_count = static_cast<int>(bytes_read / 8);
-            for (int i = 0; i < packet_count; ++i) {
-                uint64_t gpio64 = *reinterpret_cast<uint64_t*>(&buffer[i * 8]);
+        size_t i = 0;
+        while (i < bytes_read) {
+            if (buffer[i] != '>') {
+                ++i;
+                continue;
+            }
+
+            if (i + 1 >= bytes_read) break;  // Wait for more data
+
+            uint8_t first = buffer[i + 1];
+
+            if (first == 0xFF) {
+                // 8-byte packet after 0xFF
+                if (i + 9 > bytes_read) break;  // Wait for full packet
+                uint64_t gpio64 = *reinterpret_cast<uint64_t*>(&buffer[i + 2]);
+                i += 10;
+
                 if (step_mode_enabled && gpio64 == 0xFFFFFFFFFFFFFFFFull) {
                     step_mode_enabled = false;
                     std::cout << "stop step mode" << std::endl;
-                    continue;  // skip this packet
+                    continue;
                 }
 
                 bool foreign_chip = false;
                 if (cs_bit_pos >= 0 && ((gpio64 >> cs_bit_pos) & 1) != 0) {
                     ignored_chip_packets++;
-                    foreign_chip = true;  // <- Set flag instead of skipping
+                    foreign_chip = true;
                 }
-
 
                 std::string op = detect_operation(gpio64);
                 total_packets++;
 
-                if (op.empty()) {
-                    std::cout << "no operation found!" << std::endl;
-                    continue;
-                }
+                if (op.empty()) continue;
                 valid_packets++;
                 if (op == "READ") read_count++;
                 else if (op == "WRITE") write_count++;
 
                 uint32_t address = extract_bits(gpio64, active_address_bits);
                 uint32_t value = extract_bits(gpio64, active_data_bits);
-
-
                 Packet pkt{ ++counter, op, address, value, foreign_chip };
 
                 if (breakpoint_enabled) {
+                    bool match = true;
                     int safe_op = std::clamp(breakpoint_op, 0, 2);
                     int safe_chip = std::clamp(breakpoint_chip, 0, 2);
 
-                    bool match = true;
-
-                    // Match op
                     if (safe_op == 1 && pkt.op != "READ") match = false;
                     else if (safe_op == 2 && pkt.op != "WRITE") match = false;
 
-                    // Match chip origin
                     if (safe_chip == 1 && pkt.foreign_chip) match = false;
                     else if (safe_chip == 2 && !pkt.foreign_chip) match = false;
 
-                    // Address
                     if (strlen(breakpoint_address_hex) > 0) {
-                        char* endptr = nullptr;
-                        uint32_t target_addr = strtoul(breakpoint_address_hex, &endptr, 16);
-                        if (!endptr || *endptr != '\0' || pkt.address != target_addr) match = false;
+                        uint32_t target_addr = strtoul(breakpoint_address_hex, nullptr, 16);
+                        if (pkt.address != target_addr) match = false;
                     }
-
-                    // Value
                     if (strlen(breakpoint_value_hex) > 0) {
-                        char* endptr = nullptr;
-                        uint32_t target_val = strtoul(breakpoint_value_hex, &endptr, 16);
-                        if (!endptr || *endptr != '\0' || pkt.value != target_val) match = false;
+                        uint32_t target_val = strtoul(breakpoint_value_hex, nullptr, 16);
+                        if (pkt.value != target_val) match = false;
                     }
 
                     if (match && !breakpoint_triggered) {
-                        asio::write(port, asio::buffer("STOP\n", 5));
-                        log_teensy_message("STOP (breakpoint matched)", true);
+                        teensy_write("STOP");
                         breakpoint_triggered = true;
                         breakpoint_trigger_time = pkt.counter;
                         breakpoint_trigger_timestamp = std::chrono::steady_clock::now();
                         breakpoint_pending_rebuild = true;
-                        std::cout << "[Breakpoint] Matched and STOP sent at counter " << pkt.counter << "\n";
                     }
-
                 }
-
 
                 if (mt_log_file.is_open()) {
                     mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << std::dec;
@@ -705,7 +699,8 @@ void serial_thread_func() {
                     full_transaction_log.push_back(pkt);
                     if (packet_buffer.size() > 10) packet_buffer.erase(packet_buffer.begin());
                 }
-                if (pkt.counter == 1 || pkt.counter % SNAPSHOT_INTERVAL == 0){
+
+                if (pkt.counter == 1 || pkt.counter % SNAPSHOT_INTERVAL == 0) {
                     MemorySnapshot snap;
                     snap.counter = pkt.counter;
                     memcpy(snap.memory, memory_data, MEMORY_SIZE);
@@ -715,87 +710,93 @@ void serial_thread_func() {
                     memory_snapshots.push_back(snap);
                 }
 
-                //current_time_counter = pkt.counter;
                 current_time_counter.store(pkt.counter);
-
 
                 if (address < MEMORY_SIZE) {
                     memory_data[address] = static_cast<uint8_t>(value & 0xFF);
                     memory_written[address] = true;
                 }
             }
-        }
-        else {
-            // 🔤 TEXT MODE
-            for (size_t i = 0; i < bytes_read; ++i) {
-                char c = static_cast<char>(buffer[i]);
-                if (c == '\n' || c == '\r') {
-                    if (!teensy_ack_buffer.empty()) {
-                        std::string line = teensy_ack_buffer;
+            else {
 
-                        if (line == "ACK RUNNING") {
-                            teensy_running = true;
-                            teensy_status_message = "Running";
+                if (i + 3 > bytes_read) {
+                    std::cout << "Insufficient bytes for size header" << std::endl;
+                    break;
+                }
+
+                uint16_t msg_size = (buffer[i + 1] << 8) | buffer[i + 2];
+                if (i + 3 + msg_size > bytes_read) {
+                    std::cout << "Waiting for more data: expected " << msg_size
+                        << ", only have " << (bytes_read - i - 3) << std::endl;
+                    break;
+                }
+
+                std::string msg(reinterpret_cast<char*>(&buffer[i + 3]), msg_size);
+                i += 3 + msg_size;
+
+                if (!msg.empty()) {
+                    char type = msg[0];
+                    std::string content = msg.substr(1);
+
+                    switch (type) {
+                    case 'C': log_teensy_message("Config acknowledged: " + content, false); break;
+                    case 'I': 
+                        teensy_running = false; 
+                        teensy_status_message = "Idle"; 
+                        {
+                            log_teensy_message(content, false);
                         }
-                        else if (line == "ACK IDLE") {
-                            teensy_running = false;
-                            teensy_status_message = "Idle";
-                        }
-                        // Parse 0xADDRESS: 0xVALUE format
-                        else if (line.rfind("0x", 0) == 0) {
-                            size_t colon = line.find(':');
-                            if (colon != std::string::npos) {
-                                std::string addr_str = line.substr(0, colon);
-                                std::string val_str = line.substr(colon + 1);
-                                addr_str.erase(std::remove_if(addr_str.begin(), addr_str.end(), ::isspace), addr_str.end());
-                                val_str.erase(std::remove_if(val_str.begin(), val_str.end(), ::isspace), val_str.end());
-
-                                try {
-                                    uint32_t address = std::stoul(addr_str, nullptr, 16);
-                                    uint32_t value = std::stoul(val_str, nullptr, 16);
-
-                                    if (address < MEMORY_SIZE) {
-                                        read_memory_data[address] = static_cast<uint8_t>(value & 0xFF);
-                                   
-                                    }
-                                }
-                                catch (...) {
-                                    std::cerr << "Failed to parse line: " << line << std::endl;
-                                }
-                            }
-                        }
-
-                        else if (line.rfind("WE=", 0) == 0) {
-                            teensy_status_message = line;
-
+                        break;
+                    case 'X': log_teensy_message("Reset confirmed: " + content, false); break;
+                    case 'U': log_teensy_message("Unknown command: " + content, false); break;
+                    case 'G':
+                        log_teensy_message(content, false);
+                        teensy_status_message = content;
+                        {
                             std::string parsed;
-                            std::istringstream ss(line);
+                            std::istringstream ss(content);
                             std::string token;
-                            while (ss >> token) {
-                                parsed += token + "\n";
-                            }
+                            while (ss >> token) parsed += token + "\n";
                             teensy_config_response = parsed;
                             show_teensy_config_popup = true;
                         }
-                        else if (line == "STEPS DONE") {
-                            //rebuild_memory_state_up_to(current_time_counter);
+                        break;
+                    case 'R': {
+                        // Content contains: 4 bytes address + N bytes data
+                        if (content.size() < 4) {
+                            log_teensy_message("Received 'R' message with invalid length", true);
+                            break;
                         }
 
+                        uint32_t addr =
+                            (uint8_t)content[0] << 24 |
+                            (uint8_t)content[1] << 16 |
+                            (uint8_t)content[2] << 8 |
+                            (uint8_t)content[3];
 
-                        log_teensy_message(line, false);
-                        teensy_ack_buffer.clear();
+                        // Log the base address
+                        char logbuf[64];
+                        snprintf(logbuf, sizeof(logbuf), "Received memory chunk starting at 0x%08X, %zu bytes", addr, content.size() - 4);
+                        log_teensy_message(logbuf, false);
+
+
+                        for (size_t i = 4; i < content.size(); ++i) {
+                            read_memory_data[addr++] = (uint8_t)content[i];
+                        }
+
+                        break;
                     }
-                }
-                else {
-                    teensy_ack_buffer += c;
+
+                    default:
+                        log_teensy_message("Unhandled message type: '" + std::string(1, type) + "'", false);
+                        break;
+                    
+                    }
                 }
             }
         }
     }
-
-
     serial_thread_running = false;
-
 }
 
 void save_project(const std::string& project_name) {
@@ -967,10 +968,19 @@ int main(int argc, char* argv[]) {
     bool quit = false;
     while (!quit) {
         SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
-            if (event.type == SDL_QUIT) quit = true;
+
+        // Wait for an event instead of polling constantly
+        SDL_WaitEvent(&event);
+        ImGui_ImplSDL2_ProcessEvent(&event);
+
+        if (event.type == SDL_QUIT) {
+            quit = true;
         }
+
+        //while (SDL_PollEvent(&event)) {
+        //    ImGui_ImplSDL2_ProcessEvent(&event);
+        //    if (event.type == SDL_QUIT) quit = true;
+        //}
 
         ImGui_ImplSDLRenderer2_NewFrame();
         ImGui_ImplSDL2_NewFrame();
@@ -978,6 +988,9 @@ int main(int argc, char* argv[]) {
 
         static bool trigger_save_popup = false;
         static bool trigger_load_popup = false;
+
+        // Render only when needed
+        bool shouldRender = true;
 
         if (ImGui::BeginMainMenuBar()) {
             if (ImGui::BeginMenu("Project")) {
@@ -1408,8 +1421,7 @@ int main(int argc, char* argv[]) {
                         " NAME=" + chip_name + "\n";
 
 
-                    asio::write(port, asio::buffer(config_cmd));
-                    log_teensy_message(config_cmd, true);
+                    teensy_write(config_cmd);
                 }
                 else {
                     std::cerr << "Missing both /WE and /OE pin assignments!\n";
@@ -1420,8 +1432,7 @@ int main(int argc, char* argv[]) {
 
             ImGui::SameLine();
             if (ImGui::Button("Get Config")) {
-                asio::write(port, asio::buffer("GETCFG\n", 7));
-                log_teensy_message("GETCFG", true);
+                teensy_write("GETCFG");
             }
 
             if (teensy_streaming.load()) ImGui::EndDisabled();
@@ -1430,8 +1441,7 @@ int main(int argc, char* argv[]) {
                 if (ImGui::Button("Start Streaming")) {
                     setup_active_gpio_bits();
                     streaming_mode_enabled = true;
-                    asio::write(port, asio::buffer("START\n", 6));
-                    log_teensy_message("START", true);
+                    teensy_write("START");
                     teensy_streaming.store(true);
                 }
 
@@ -1445,8 +1455,7 @@ int main(int argc, char* argv[]) {
 
                 if (ImGui::Button("Step")) {
                     std::string cmd = "STEP_" + std::to_string(step_count) + "\n";
-                    asio::write(port, asio::buffer(cmd));
-                    log_teensy_message(cmd, true);
+                    teensy_write(cmd);
                     step_mode_enabled = true;  // 👈 Enable step mode
                 }
 
@@ -1479,16 +1488,14 @@ int main(int argc, char* argv[]) {
 
                 if (ImGui::Button("Reset CPU")) {
                     std::string cmd = "RESET_CPU \n";
-                    asio::write(port, asio::buffer(cmd));
-                    log_teensy_message(cmd, true);
+                    teensy_write(cmd);
                 }
             }
 
             else {
                 if (ImGui::Button("Stop Streaming")) {
                     streaming_mode_enabled = false; // Disable binary parsing
-                    asio::write(port, asio::buffer("STOP\n", 5));
-                    log_teensy_message("STOP", true);
+                    teensy_write("STOP");
                     teensy_streaming.store(false);
                     rebuild_memory_state_up_to(current_time_counter);
                 }
@@ -1675,8 +1682,7 @@ int main(int argc, char* argv[]) {
 
         // Optional: Add Write/Modify UI later here
         if (ImGui::Button("Read chip memory")) {
-            asio::write(port, asio::buffer("READALL\n", 8));
-            log_teensy_message("READALL", true);
+            teensy_write("READ_0x0000_0x00");
             std::fill(std::begin(read_memory_data), std::end(read_memory_data), 0xFF);
         }
 
@@ -1685,17 +1691,36 @@ int main(int argc, char* argv[]) {
 
         if (ImGui::Button("Write chip memory")) {
             try {
-                // 1. Send command
-                asio::write(port, asio::buffer("WRITEALL\n", 9));
-                log_teensy_message("WRITEALL", true);
+                const size_t MAX_CHUNK_SIZE = 500;
+                constexpr size_t TOTAL_SIZE = sizeof(read_memory_data);  // 65536 for 64KB
 
-                // 3. Send raw memory data
-                asio::write(port, asio::buffer(read_memory_data, MEMORY_SIZE));
+                size_t base_addr = 0;
 
-                // 4. Notify done
-                asio::write(port, asio::buffer("WRITEALL DONE\n", 14));
-                log_teensy_message("WRITEALL DONE", true);
+                while (base_addr < TOTAL_SIZE) {
+                    size_t chunk_len = std::min(MAX_CHUNK_SIZE, TOTAL_SIZE - base_addr);
 
+                    // Convert chunk to hex string
+                    std::string hex_data;
+                    hex_data.reserve(chunk_len * 2);
+                    for (size_t i = 0; i < chunk_len; ++i) {
+                        char hex_byte[3];
+                        snprintf(hex_byte, sizeof(hex_byte), "%02X", read_memory_data[base_addr + i]);
+                        hex_data += hex_byte;
+                    }
+
+                    // Construct command
+                    char cmd[64];
+                    snprintf(cmd, sizeof(cmd), "WRITE_0x%06zX_%zu_", base_addr, chunk_len);
+                    std::string full_cmd = cmd + hex_data;
+
+                    // Send to Teensy
+                    teensy_write(full_cmd);
+
+                    base_addr += chunk_len;
+                    break;  // prevent further chunks
+                }
+
+                log_teensy_message("Write complete from pc!", true);
             }
             catch (const std::exception& e) {
                 log_teensy_message(std::string("Write failed: ") + e.what(), false);
@@ -1814,7 +1839,7 @@ int main(int argc, char* argv[]) {
         if (xtal_freq_mhz < 0.1f) xtal_freq_mhz = 0.1f;
 
         // New Option: What CPU should do if not streaming
-        static int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
+        //static int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
         ImGui::Text("If not streaming CPU should:");
         ImGui::RadioButton("not run (0 Hz clk)", &cpu_idle_behavior, 0); ImGui::SameLine();
         ImGui::RadioButton("run at XTAL frequency", &cpu_idle_behavior, 1);
@@ -2007,8 +2032,6 @@ int main(int argc, char* argv[]) {
         }
 
 
-
-        ImGui::Render();
         if (breakpoint_pending_rebuild) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - breakpoint_trigger_timestamp
@@ -2026,10 +2049,16 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        SDL_RenderClear(renderer);
-        ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+        // Only proceed if rendering is required
+        if (shouldRender) {
+            ImGui::Render();
+            SDL_RenderClear(renderer);
+            ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
+            SDL_RenderPresent(renderer);
+        }
 
-        SDL_RenderPresent(renderer);
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+
     }
 
     running = false;
