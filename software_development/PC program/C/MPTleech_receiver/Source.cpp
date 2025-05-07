@@ -905,7 +905,1093 @@ void load_project(const std::string& project_name) {
     user_overridden_slider = true;
 }
 
+void render_memory_view() {
+    ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
+    ImGui::Begin("Memory view");
 
+
+
+    if (ImGui::Button("Save bin file")) {
+        strcpy_s(unknown_byte_input, "FF");  // Default fill for unknown
+        show_save_bin_popup = true;
+        ImGui::OpenPopup("Save Memory to Bin");
+    }
+
+    if (ImGui::BeginPopupModal("Save Memory to Bin", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+
+        ImGui::Text("Enter hex value to replace unknown (??) bytes:");
+        ImGui::InputText("Hex byte", unknown_byte_input, IM_ARRAYSIZE(unknown_byte_input), ImGuiInputTextFlags_CharsHexadecimal);
+
+        if (ImGui::Button("Proceed")) {
+            unsigned int fill_byte = 0xFF;
+            sscanf_s(unknown_byte_input, "%x", &fill_byte);
+
+            std::string full_filename = chip_name;
+            full_filename += "_spied.bin";  // simpler concatenation
+
+            char filename[MAX_PATH] = {};
+            strncpy_s(filename, sizeof(filename), full_filename.c_str(), _TRUNCATE);
+
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = NULL;
+            ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
+            ofn.lpstrFile = filename;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrInitialDir = ".";
+            ofn.lpstrTitle = "Save Memory Dump";
+            ofn.Flags = OFN_OVERWRITEPROMPT;
+            ofn.lpstrDefExt = "bin";  // <- ensures .bin gets added if user omits it
+
+
+            if (GetSaveFileNameA(&ofn)) {
+                std::string path = ofn.lpstrFile;
+                // Ensure the extension is .bin
+                if (path.size() < 4 || path.substr(path.size() - 4) != ".bin") {
+                    path += ".bin";
+                }
+
+                std::ofstream file(path, std::ios::binary);
+
+
+                if (file) {
+                    for (size_t i = 0; i < MEMORY_SIZE; ++i) {
+                        uint8_t b = memory_written[i] ? memory_data[i] : static_cast<uint8_t>(fill_byte);
+                        file.write(reinterpret_cast<const char*>(&b), 1);
+                    }
+                    file.close();
+                }
+            }
+
+            show_save_bin_popup = false;
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            show_save_bin_popup = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    uint64_t min_counter = 0;
+    uint64_t max_counter = 0;
+    {
+        std::lock_guard<std::mutex> lock(packet_mutex);
+        if (!full_transaction_log.empty())
+            max_counter = full_transaction_log.back().counter;
+    }
+
+    uint64_t temp_counter = current_time_counter.load();
+    if (ImGui::SliderScalar("Time", ImGuiDataType_U64, &temp_counter, &min_counter, &max_counter)) {
+        user_overridden_slider = true;
+        current_time_counter.store(temp_counter);
+        rebuild_memory_state_up_to(temp_counter);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("##back", ImGuiDir_Left)) {
+        uint64_t t = current_time_counter.load();
+        if (t > 0) {
+            t--;
+            current_time_counter.store(t);
+            rebuild_memory_state_up_to(t);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::ArrowButton("##forward", ImGuiDir_Right)) {
+        uint64_t t = current_time_counter.load();
+        if (t < max_counter) {
+            t++;
+            current_time_counter.store(t);
+            rebuild_memory_state_up_to(t);
+        }
+    }
+
+    // HEADER SECTION - always visible
+    //ImGui::Indent(10.0f);  // Align first column
+    ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Offset(h)");
+    ImGui::SameLine(78);
+    for (int col = 0; col < 16; ++col) {
+        char col_label[4];
+        snprintf(col_label, sizeof(col_label), "%02X", col);
+        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%s", col_label);
+        if (col != 15) ImGui::SameLine();
+    }
+
+    ImVec2 charSize = ImGui::CalcTextSize("FF");  // Approx width of 2 hex chars
+
+    // ASCII header (placed below hex header)
+    float ascii_start_x = 70 + 16 * (charSize.x + 6) + 25;
+    ImGui::SetCursorPosX(ascii_start_x);
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Decoded text");
+    //ImGui::Unindent(70.0f);  // Always unindent after
+
+    // Add a small separator line or spacing to visually divide
+    ImGui::Separator();
+
+    ImGui::BeginChild("HexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (scroll_to_recent_address && !recent_addresses.empty()) {
+        int latest_addr = recent_addresses.back();
+        float line_height = ImGui::GetTextLineHeightWithSpacing();
+        float scroll_y = (latest_addr / 16) * line_height;
+        ImGui::SetScrollY(scroll_y - ImGui::GetWindowHeight() * 0.5f);  // Center on it
+        scroll_to_recent_address = false;
+    }
+
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+    ImGui::PushFont(ImGui::GetFont());
+
+    // Constants
+    float line_height = ImGui::GetTextLineHeightWithSpacing();
+    int total_rows = MEMORY_SIZE / 16;
+
+    // Calculate visible rows
+    int prebuffer_rows = 2;  // Draw 2 extra rows above
+    int first_row = std::max(0, static_cast<int>(ImGui::GetScrollY() / line_height) - prebuffer_rows);
+    int visible_rows = static_cast<int>(ImGui::GetWindowHeight() / line_height);
+    int last_row = std::min(first_row + visible_rows + 3, total_rows); // +2 for margin
+
+    // Add vertical spacing to simulate skipped lines
+    ImGui::Dummy(ImVec2(0, first_row * line_height));
+
+    for (int row = first_row; row < last_row; ++row) {
+        size_t base_addr = row * 16;
+
+        ImGui::Text("%08X", static_cast<unsigned int>(base_addr));
+        ImGui::SameLine(70);
+
+        for (int col = 0; col < 16; ++col) {
+            size_t addr = base_addr + col;
+            if (addr >= MEMORY_SIZE) continue;
+
+            bool is_recent = false;
+            int recent_index = -1;
+            for (int i = 0; i < recent_addresses.size(); ++i) {
+                if (recent_addresses[i] == addr) {
+                    is_recent = true;
+                    recent_index = i;
+                    break;
+                }
+            }
+
+            if (memory_written[addr]) {
+                if (is_recent) {
+                    static const ImVec4 red_shades[10] = {
+                        ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                        ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+                        ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
+                        ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+                    };
+                    ImVec4 shade = red_shades[9 - std::min(recent_index, 9)];
+                    ImGui::TextColored(shade, "%02X", memory_data[addr]);
+                }
+                else {
+                    ImVec4 color;
+                    switch (memory_color[addr]) {
+                    case MemColor::READ: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
+                    case MemColor::WRITE: color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); break;
+                    case MemColor::FOREIGN: color = ImVec4(0.8f, 0.4f, 1.0f, 1.0f); break;
+                    default: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
+                    }
+                    ImGui::TextColored(color, "%02X", memory_data[addr]);
+                }
+            }
+            else {
+                ImGui::TextDisabled("??");
+            }
+
+            if (col != 15) ImGui::SameLine();
+        }
+
+        // ASCII preview
+        ImGui::SameLine(ascii_start_x - 22);
+        for (int col = 0; col < 16; ++col) {
+            size_t addr = base_addr + col;
+            char c = ' ';
+            if (addr < MEMORY_SIZE && memory_written[addr]) {
+                c = memory_data[addr];
+                if (c < 32 || c > 126) c = '.';
+            }
+            ImGui::Text("%c", c);
+            if (col != 15) ImGui::SameLine();
+        }
+    }
+
+    // Dummy spacing for invisible lines below
+    ImGui::Dummy(ImVec2(0, (total_rows - last_row) * line_height));
+
+
+    ImGui::PopFont();
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+void render_read_write_memory() {
+    ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
+    ImGui::Begin("Read/Write Memory");
+
+    // Optional: Add Write/Modify UI later here
+    if (ImGui::Button("Read chip memory")) {
+        teensy_write("READ_0x0000_0x00");
+        std::fill(std::begin(read_memory_data), std::end(read_memory_data), 0xFF);
+    }
+
+
+    ImGui::SameLine();
+
+    if (ImGui::Button("Write chip memory")) {
+        try {
+            const size_t MAX_CHUNK_SIZE = 500;
+            constexpr size_t TOTAL_SIZE = sizeof(read_memory_data);  // 65536 for 64KB
+
+            size_t base_addr = 0;
+
+            while (base_addr < TOTAL_SIZE) {
+                size_t chunk_len = std::min(MAX_CHUNK_SIZE, TOTAL_SIZE - base_addr);
+
+                // Convert chunk to hex string
+                std::string hex_data;
+                hex_data.reserve(chunk_len * 2);
+                for (size_t i = 0; i < chunk_len; ++i) {
+                    char hex_byte[3];
+                    snprintf(hex_byte, sizeof(hex_byte), "%02X", read_memory_data[base_addr + i]);
+                    hex_data += hex_byte;
+                }
+
+                // Construct command
+                char cmd[64];
+                snprintf(cmd, sizeof(cmd), "WRITE_0x%06zX_%zu_", base_addr, chunk_len);
+                std::string full_cmd = cmd + hex_data;
+
+                // Send to Teensy
+                teensy_write(full_cmd);
+
+                base_addr += chunk_len;
+                break;  // prevent further chunks
+            }
+
+            log_teensy_message("Write complete from pc!", true);
+        }
+        catch (const std::exception& e) {
+            log_teensy_message(std::string("Write failed: ") + e.what(), false);
+        }
+    }
+
+    if (ImGui::Button("Save Readout to Bin")) {
+        char filename[MAX_PATH] = {};
+        strcpy_s(filename, "chip_readout.bin");
+
+        OPENFILENAMEA ofn = {};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = NULL;
+        ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrInitialDir = ".";
+        ofn.lpstrTitle = "Save Readout";
+        ofn.Flags = OFN_OVERWRITEPROMPT;
+        ofn.lpstrDefExt = "bin";
+
+        if (GetSaveFileNameA(&ofn)) {
+            std::ofstream file(ofn.lpstrFile, std::ios::binary);
+            if (file) {
+                file.write(reinterpret_cast<const char*>(read_memory_data), MEMORY_SIZE);
+                file.close();
+            }
+        }
+    }
+
+    static int edit_byte_addr = -1;
+    static char hex_input[5] = "";
+    bool open_edit_popup = false;
+
+    // Load File Button
+    if (ImGui::Button("Load file into memory")) {
+        char filename[MAX_PATH] = {};
+        OPENFILENAMEA ofn = {};
+        ofn.lStructSize = sizeof(ofn);
+        ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
+        ofn.lpstrFile = filename;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.lpstrTitle = "Select a file to load";
+        ofn.Flags = OFN_FILEMUSTEXIST;
+
+        if (GetOpenFileNameA(&ofn)) {
+            std::ifstream in(filename, std::ios::binary);
+            if (in) {
+                std::vector<uint8_t> buffer(std::istreambuf_iterator<char>(in), {});
+                size_t len = std::min(buffer.size(), static_cast<size_t>(MEMORY_SIZE));
+                std::copy(buffer.begin(), buffer.begin() + len, read_memory_data);
+            }
+        }
+    }
+
+    // --- Header (OUTSIDE the scrollable region) ---
+    ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Offset(h)");
+    ImGui::SameLine(78);
+    for (int col = 0; col < 16; ++col) {
+        char col_label[4];
+        sprintf_s(col_label, "%02X", col);
+        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%s", col_label);
+        if (col != 15) ImGui::SameLine();
+    }
+
+    ImVec2 cell_size = ImVec2(ImGui::CalcTextSize("FF").x + 2.0f, ImGui::GetTextLineHeight());
+    float rw_ascii_start_x = 70 + 16 * (cell_size.x + 6.0f) + 25;
+
+    ImGui::SetCursorPosX(rw_ascii_start_x);
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Decoded text");
+
+    ImGui::Separator();  // Visual separation
+
+
+    ImGui::BeginChild("ReadMemoryHexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+
+    float line_height = ImGui::GetTextLineHeightWithSpacing();
+    int total_rows = MEMORY_SIZE / 16;
+
+    int prebuffer_rows = 2;
+    int first_row = std::max(0, static_cast<int>(ImGui::GetScrollY() / line_height) - prebuffer_rows);
+    int visible_rows = static_cast<int>(ImGui::GetWindowHeight() / line_height);
+    int last_row = std::min(first_row + visible_rows + 3, total_rows);
+
+    ImGui::Dummy(ImVec2(0, first_row * line_height));  // Skip lines above
+
+    for (int row = first_row; row < last_row; ++row) {
+        size_t base_addr = row * 16;
+
+        ImGui::Text("%08X", static_cast<unsigned int>(base_addr));
+        ImGui::SameLine(70);
+
+        for (int col = 0; col < 16; ++col) {
+            size_t addr = base_addr + col;
+            char label[4];
+            sprintf_s(label, "%02X", read_memory_data[addr]);
+            ImGui::Text("%s", label);
+            if (col != 15) ImGui::SameLine();
+        }
+
+        ImGui::SameLine(rw_ascii_start_x - 22);
+        for (int col = 0; col < 16; ++col) {
+            size_t addr = base_addr + col;
+            char c = (read_memory_data[addr] >= 32 && read_memory_data[addr] <= 126) ? read_memory_data[addr] : '.';
+            ImGui::Text("%c", c);
+            if (col != 15) ImGui::SameLine();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, (total_rows - last_row) * line_height));  // Skip lines below
+
+
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+void render_gui() {
+    ImGuiIO& io = ImGui::GetIO();
+
+    static bool trigger_save_popup = false;
+    static bool trigger_load_popup = false;
+
+    if (ImGui::BeginMainMenuBar()) {
+        if (ImGui::BeginMenu("Project")) {
+            if (ImGui::MenuItem("Save Project")) {
+                std::cout << "open" << "\n";
+                trigger_save_popup = true;
+            }
+            if (ImGui::MenuItem("Load Project")) {
+                std::cout << "open" << "\n";
+                trigger_load_popup = true;
+                ImGui::OpenPopup("LoadProjectPopup");
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::EndMainMenuBar();
+    }
+
+    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) || trigger_save_popup) {
+        ImGui::OpenPopup("SaveProjectPopup");
+        trigger_save_popup = false;
+    }
+    if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) || trigger_load_popup) {
+        ImGui::OpenPopup("LoadProjectPopup");
+        trigger_load_popup = false;
+    }
+
+
+    // Save Project popup
+    static char project_name_input[64] = "NewProject";
+    if (ImGui::BeginPopupModal("SaveProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        // Handle ESC key
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::InputText("Project Name", project_name_input, IM_ARRAYSIZE(project_name_input));
+        if (ImGui::Button("Save")) {
+            save_project(project_name_input);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(650, 0), ImGuiCond_Appearing);  // width = 250, height = auto
+    if (ImGui::BeginPopupModal("LoadProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        static std::vector<std::string> project_dirs;
+        static bool need_reload = true;
+
+        // Handle ESC key
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            // Your cancel logic here (e.g. clear state, reset vars)
+            need_reload = true;
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (need_reload) {
+            project_dirs.clear();
+            WIN32_FIND_DATAA ffd;
+            HANDLE hFind = FindFirstFileA("projects\\*", &ffd);
+            if (hFind != INVALID_HANDLE_VALUE) {
+                do {
+                    if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+                        strcmp(ffd.cFileName, ".") != 0 &&
+                        strcmp(ffd.cFileName, "..") != 0) {
+                        project_dirs.push_back(ffd.cFileName);
+                    }
+                } while (FindNextFileA(hFind, &ffd));
+                FindClose(hFind);
+            }
+            need_reload = false;
+        }
+
+        for (const std::string& dir : project_dirs) {
+            if (ImGui::Selectable(dir.c_str())) {
+                load_project(dir);
+                ImGui::CloseCurrentPopup();
+                need_reload = true;
+            }
+        }
+
+        if (ImGui::Button("Cancel")) {
+            ImGui::CloseCurrentPopup();
+            need_reload = true;
+        }
+        ImGui::EndPopup();
+    }
+
+
+
+    render_memory_view();
+
+
+    ImGui::SetNextWindowSize(ImVec2(500, 700), ImGuiCond_Once);
+    ImGui::Begin("Packet Monitor");
+
+    if (ImGui::BeginCombo("Serial Port", port_labels.empty() ? "" : port_labels[selected_port_index].c_str())) {
+        for (int i = 0; i < port_labels.size(); i++) {
+            bool is_selected = (selected_port_index == i);
+            if (ImGui::Selectable(port_labels[i].c_str(), is_selected)) {
+                selected_port_index = i;
+            }
+            if (is_selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::Button("Refresh Ports")) {
+        available_ports = enumerate_serial_ports(port_labels);
+        if (!available_ports.empty()) {
+            selected_port_index = std::min(selected_port_index, static_cast<int>(available_ports.size() - 1));
+        }
+        else {
+            selected_port_index = 0;
+        }
+    }
+
+    ImGui::SameLine();
+    if (!serial_thread_running && (!available_ports.empty() ? ImGui::Button("Connect") : (ImGui::BeginDisabled(), ImGui::Button("Connect")) && (ImGui::EndDisabled(), false))) {
+        try {
+            port.close();
+            port.open(available_ports[selected_port_index].c_str());
+            port.set_option(serial_port::baud_rate(2000000));
+            port.set_option(serial_port::flow_control(serial_port::flow_control::none));
+            port.set_option(serial_port::character_size(8));
+            port.set_option(serial_port::parity(serial_port::parity::none));
+            port.set_option(serial_port::stop_bits(serial_port::stop_bits::one));
+            running = true;
+            serial_thread_running = true;
+            reader = std::thread(serial_thread_func);
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Failed to open port: " << e.what() << std::endl;
+        }
+    }
+    if (serial_thread_running && ImGui::Button("Disconnect")) {
+        running = false;
+
+        asio::error_code ec;
+
+        if (port.is_open()) {
+            port.cancel(ec); // cancel pending read
+            port.close(ec);  // closes port
+        }
+
+        if (reader.joinable()) {
+            reader.join();  // thread will exit due to ec from read_some
+        }
+
+        context.restart();  // reset asio for reuse
+    }
+
+    if (serial_thread_running) {
+        ImGui::SameLine();
+        if (teensy_streaming.load()) ImGui::BeginDisabled();
+
+        //ImGui::SameLine();
+        if (ImGui::Button("Send Config")) {
+            int we_teensy = -1, oe_teensy = -1, cs_teensy = -1;
+
+
+            std::vector<std::pair<std::string, int>> address_pins;
+            std::vector<std::pair<std::string, int>> data_pins;
+
+            for (int i = 0; i < TOTAL_PINS; ++i) {
+                int pin_idx = selected_pin_function[i];
+                if (pin_idx < 0 || pin_idx >= IM_ARRAYSIZE(pin_options)) continue;
+
+                std::string label = pin_options[pin_idx];
+
+                int chip_pin = i + 1;
+                if (selected_pin_count == 30) chip_pin -= 1;
+                else if (selected_pin_count == 28) chip_pin -= 2;
+
+                int teensy_pin = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
+
+                if (label == "/WE") we_teensy = teensy_pin;
+                else if (label == "/OE") oe_teensy = teensy_pin;
+                else if (label == "/CS") cs_teensy = teensy_pin;
+                else if (label.rfind("A", 0) == 0) address_pins.emplace_back(label, teensy_pin);
+                else if (label.rfind("D", 0) == 0) data_pins.emplace_back(label, teensy_pin);
+            }
+
+            if (we_teensy != -1 || oe_teensy != -1) {
+                int mode = selected_mode;
+                int freq = selected_freq_khz * 1000;
+                int xtal_freq = xtal_freq_mhz * 1000000;
+
+                // Sort A and D pins by label (A1 < A2 < A3, D1 < D2 < D3 ...)
+                std::sort(address_pins.begin(), address_pins.end(), [](const auto& a, const auto& b) {
+                    return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
+                    });
+
+                std::sort(data_pins.begin(), data_pins.end(), [](const auto& a, const auto& b) {
+                    return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
+                    });
+
+                std::string addrs = "ADDRS=";
+                for (size_t i = 0; i < address_pins.size(); ++i) {
+                    if (i > 0) addrs += ",";
+                    addrs += std::to_string(address_pins[i].second);
+                }
+
+                std::string datas = "DATAS=";
+                for (size_t i = 0; i < data_pins.size(); ++i) {
+                    if (i > 0) datas += ",";
+                    datas += std::to_string(data_pins[i].second);
+                }
+
+                std::string config_cmd = "CFG WE=" + std::to_string(we_teensy) +
+                    " OE=" + std::to_string(oe_teensy) +
+                    " CS=" + std::to_string(cs_teensy) +
+                    " MODE=" + std::to_string(mode) +
+                    " FREQ=" + std::to_string(freq) +
+                    " XTAL=" + std::to_string(xtal_freq) +
+                    " IDLE=" + std::to_string(cpu_idle_behavior) +
+                    " " + addrs +
+                    " " + datas +
+                    " NAME=" + chip_name + "\n";
+
+
+                teensy_write(config_cmd);
+            }
+            else {
+                std::cerr << "Missing both /WE and /OE pin assignments!\n";
+            }
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Get Config")) {
+            teensy_write("GETCFG");
+        }
+
+        if (teensy_streaming.load()) ImGui::EndDisabled();
+
+        if (!teensy_streaming.load()) {
+            if (ImGui::Button("Start Streaming")) {
+                setup_active_gpio_bits();
+                streaming_mode_enabled = true;
+                teensy_write("START");
+                teensy_streaming.store(true);
+            }
+
+            ImGui::SameLine();
+
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputInt("##step_count", &step_count);
+            if (step_count < 1) step_count = 1;
+
+            ImGui::SameLine();
+
+            if (ImGui::Button("Step")) {
+                std::string cmd = "STEP_" + std::to_string(step_count) + "\n";
+                teensy_write(cmd);
+                step_mode_enabled = true;  // 👈 Enable step mode
+            }
+
+            ImGui::Checkbox("Enable Streaming Breakpoint", &breakpoint_enabled);
+
+            ImGui::Text("Stop if packet matches:");
+            ImGui::SameLine();
+            ImGui::Text("Operation:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80);
+            ImGui::Combo("##op", &breakpoint_op, "Both\0READ\0WRITE\0");
+
+            ImGui::SameLine();
+            ImGui::Text("Chip:");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100);
+            ImGui::Combo("##chip", &breakpoint_chip, "Both\0This chip\0Foreign\0");
+
+            ImGui::Text("Address (hex):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputText("##addr", breakpoint_address_hex, IM_ARRAYSIZE(breakpoint_address_hex), ImGuiInputTextFlags_CharsHexadecimal);
+
+            ImGui::SameLine();
+            ImGui::Text("Value (hex):");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(100);
+            ImGui::InputText("##val", breakpoint_value_hex, IM_ARRAYSIZE(breakpoint_value_hex), ImGuiInputTextFlags_CharsHexadecimal);
+
+
+            if (ImGui::Button("Reset CPU")) {
+                std::string cmd = "RESET_CPU \n";
+                teensy_write(cmd);
+            }
+        }
+
+        else {
+            if (ImGui::Button("Stop Streaming")) {
+                streaming_mode_enabled = false; // Disable binary parsing
+                teensy_write("STOP");
+                teensy_streaming.store(false);
+                rebuild_memory_state_up_to(current_time_counter);
+            }
+
+            // Draw buffer backlog status dot
+            {
+                size_t buffer_size = packet_buffer.size();
+                const size_t warning_threshold = 500;
+
+                ImVec4 dot_color = (buffer_size > warning_threshold)
+                    ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f)  // Red
+                    : ImVec4(0.2f, 1.0f, 0.2f, 1.0f); // Green
+                ImGui::SameLine();
+                ImGui::Text("Buffer Status: ");
+                ImGui::SameLine();
+                ImGui::ColorButton("##buffer_dot", dot_color, ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop, ImVec2(12, 12));
+
+                ImGui::SameLine();
+                ImGui::Text("%s", buffer_size > warning_threshold ? "Backlog detected" : "Healthy");
+            }
+
+        }
+        ImGui::NewLine();
+
+        if (ImGui::Button("Save MT file")) {
+            char filename[MAX_PATH] = {};
+            strcpy_s(filename, "transactions.mt");
+
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = NULL;
+            ofn.lpstrFilter = "Memory Transactions\0*.mt\0All Files\0*.*\0";
+            ofn.lpstrFile = filename;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.lpstrTitle = "Save Memory Transactions";
+            ofn.lpstrDefExt = "mt";
+            ofn.Flags = OFN_OVERWRITEPROMPT;
+
+            if (GetSaveFileNameA(&ofn)) {
+                std::ifstream temp_in(temp_mt_log_filename, std::ios::binary);
+                std::ofstream perm_out(ofn.lpstrFile, std::ios::binary);
+                perm_out << temp_in.rdbuf();
+            }
+        }
+        ImGui::SameLine();
+
+        if (ImGui::Button("Clear All Data")) {
+            {
+                std::lock_guard<std::mutex> lock(packet_mutex);
+                packet_buffer.clear();
+                full_transaction_log.clear();
+            }
+
+            // Clear memory contents and flags
+            std::fill(std::begin(memory_data), std::end(memory_data), 0);
+            std::fill(std::begin(memory_written), std::end(memory_written), false);
+            std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
+            std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
+
+            // Clear snapshots and recent addresses
+            memory_snapshots.clear();
+            recent_addresses.clear();
+            scroll_to_recent_address = false;
+
+            // Reset counters
+            total_bytes = 0;
+            total_packets = 0;
+            valid_packets = 0;
+            read_count = 0;
+            write_count = 0;
+            ignored_chip_packets = 0;
+
+            // Reset time travel state
+            current_time_counter.store(0);
+            user_overridden_slider = false;
+
+            // Reset temp MT log file
+            if (mt_log_file.is_open()) {
+                mt_log_file.close();
+                mt_log_file.open(temp_mt_log_filename, std::ios::out | std::ios::trunc);
+            }
+        }
+
+
+    }
+
+
+    static auto last_stats_time = std::chrono::high_resolution_clock::now();
+    static double mbps = 0.0;
+    static double mean_us = 0.0;
+    static uint64_t last_valid_packet_count = 0;
+
+    auto now = std::chrono::high_resolution_clock::now();
+    double elapsed = std::chrono::duration<double>(now - last_stats_time).count();
+
+    if (elapsed >= 1.0) {
+        mbps = (total_bytes * 8.0) / (elapsed * 1e6); // Megabits per second
+        total_bytes = 0;
+
+        uint64_t delta_packets = valid_packets - last_valid_packet_count;
+        last_valid_packet_count = valid_packets;
+
+        mean_us = (delta_packets > 0) ? (elapsed * 1e6) / delta_packets : 0.0;
+        last_stats_time = now;
+    }
+    ImGui::NewLine();
+    ImGui::Text("Transfer Rate: %.2f Mbps", mbps);
+    ImGui::Text("Avg Time Between Ops: %.2f us", mean_us);
+    // Line 1: Total packets
+    ImGui::Text("Total packets %llu : %llu valid | %llu invalid",
+        total_packets, valid_packets, total_packets - valid_packets);
+
+    // Line 2: Valid packets with green "Writes"
+    ImGui::Text("Valid packets %llu :", valid_packets);
+    ImGui::SameLine();
+    ImGui::Text("Reads %llu |", read_count);
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.3f, 1.0f));  // Green
+    ImGui::Text("Writes %llu", write_count);
+    ImGui::PopStyleColor();
+
+    // Line 3: Local vs Foreign with purple "Foreign"
+    ImGui::Text("Local packets: %llu |", valid_packets - ignored_chip_packets);
+    ImGui::SameLine();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.4f, 1.0f, 1.0f));  // Purple
+    ImGui::Text("Foreign packets: %llu", ignored_chip_packets);
+    ImGui::PopStyleColor();
+
+    ImGui::Separator();
+    ImGui::BeginChild("ScrollRegion", ImVec2(0, 200), true);
+
+    static const ImVec4 red_shades[10] = {
+        ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+        ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
+        ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
+        ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
+    };
+
+    std::lock_guard<std::mutex> lock(packet_mutex);
+
+    size_t total = full_transaction_log.size();
+    int shown = 0;
+    for (int i = static_cast<int>(total) - 1; i >= 0 && shown < 10; --i) {
+        if (full_transaction_log[i].counter <= current_time_counter) {
+            const Packet& pkt = full_transaction_log[i];
+
+            // Determine red intensity based on recent_addresses
+            int recent_index = -1;
+            for (int j = 0; j < static_cast<int>(recent_addresses.size()); ++j) {
+                if (recent_addresses[j] == pkt.address) {
+                    recent_index = j;
+                    break;
+                }
+            }
+
+            // Format base line
+            char line[128];
+            snprintf(line, sizeof(line), "%llu | %s | 0x%X | 0x%X%s",
+                pkt.counter,
+                pkt.op.c_str(),
+                pkt.address,
+                pkt.value,
+                pkt.foreign_chip ? " | foreign" : ""
+            );
+
+            if (recent_index != -1) {
+                ImVec4 color = red_shades[9 - std::min(recent_index, 9)];
+                ImGui::TextColored(color, "%s", line);
+            }
+            else {
+                ImGui::Text("%s", line);
+            }
+
+            ++shown;
+        }
+    }
+
+
+    ImGui::EndChild();
+    ImGui::End();
+
+    render_read_write_memory();
+
+
+    ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_Once);
+    ImGui::Begin("Chip Configuration");
+
+    ImGui::InputText("Chip Name", &chip_name[0], 64);
+    ImGui::RadioButton("28 pins", &selected_pin_count, 28); ImGui::SameLine();
+    ImGui::RadioButton("30 pins", &selected_pin_count, 30); ImGui::SameLine();
+    ImGui::RadioButton("32 pins", &selected_pin_count, 32);
+    ImGui::Separator();
+
+    // New Input: Onboard XTAL frequency in MHz
+    ImGui::Text("Onboard XTAL Frequency:");
+    ImGui::InputInt("MHz", &xtal_freq_mhz);
+    if (xtal_freq_mhz < 0.1f) xtal_freq_mhz = 0.1f;
+
+    // New Option: What CPU should do if not streaming
+    //static int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
+    ImGui::Text("If not streaming CPU should:");
+    ImGui::RadioButton("not run (0 Hz clk)", &cpu_idle_behavior, 0); ImGui::SameLine();
+    ImGui::RadioButton("run at XTAL frequency", &cpu_idle_behavior, 1);
+
+    ImGui::Text("Streaming Frequency (max. 70kHz) :");
+    ImGui::InputInt("kHz", &selected_freq_khz);
+    if (selected_freq_khz < 1) selected_freq_khz = 1;
+
+    ImGui::Text("Capture Mode:");
+    ImGui::RadioButton("Interrupt", &selected_mode, 0); ImGui::SameLine();
+    ImGui::RadioButton("Continuous", &selected_mode, 1);
+
+    if (ImGui::Button("Save Config")) save_config_to_json();
+    ImGui::SameLine();
+    if (ImGui::Button("Load Config")) load_config_from_json();
+
+    ImGui::Separator();
+    ImGui::BeginChild("ChipLayout", ImVec2(0, 600), false);
+    ImGui::Columns(3, NULL, false);
+
+    ImVec4 vccColor = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);   // Red
+    ImVec4 gndColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);   // White
+
+
+    ImVec4 addrColor = ImVec4(0.8f, 0.8f, 0.1f, 1.0f);
+    ImVec4 dataColor = ImVec4(0.2f, 0.9f, 0.3f, 1.0f);
+    ImVec4 ctrlColor = ImVec4(0.3f, 0.5f, 0.9f, 1.0f);
+    ImVec4 ncColor = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+
+    auto getColorForLabel = [&](const std::string& label) {
+        if (label == "NC") return ncColor;
+        if (label == "VCC") return vccColor;
+        if (label == "GND") return gndColor;
+        if (label == "/CS" || label == "/WE" || label == "/OE") return ctrlColor;
+        if (label.rfind("A", 0) == 0) return addrColor;
+        if (label.rfind("D", 0) == 0) return dataColor;
+        return ImVec4(1, 1, 1, 1);  // default white
+    };
+
+
+
+    // Calculate vertical shift based on removed top pins
+    float dropdown_height = ImGui::GetTextLineHeightWithSpacing();
+    int pin_start_offset = (32 - selected_pin_count) / 2;
+    ImGui::Dummy(ImVec2(0, pin_start_offset * (dropdown_height + 5)));
+
+    // Render visible left-side pins (1 to N/2)
+    for (int i = 0; i < selected_pin_count / 2; ++i) {
+        int pin_index = i + pin_start_offset;
+
+        ImGui::PushID(pin_index);
+
+        // Last pin in left column becomes fixed GND
+        if (i == (selected_pin_count / 2 - 1)) {
+            // Force this pin to be GND (index 2 in pin_options)
+            selected_pin_function[pin_index] = 2;
+
+            ImVec4 gndColor = getColorForLabel("GND");
+            ImGui::PushStyleColor(ImGuiCol_Text, gndColor);
+            ImGui::BeginDisabled();
+
+            int dummy_index = 0;
+            ImGui::Combo(("Pin " + std::to_string(i + 1)).c_str(), &dummy_index, "GND");
+
+
+            ImGui::EndDisabled();
+            ImGui::PopStyleColor();
+
+            selected_pin_function[pin_index] = -1;  // Optional: Mark internally as GND (not from dropdown options)
+        }
+        else {
+            ImVec4 color = getColorForLabel(pin_options[selected_pin_function[pin_index]]);
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::Combo(("Pin " + std::to_string(i + 1)).c_str(), &selected_pin_function[pin_index], pin_options, IM_ARRAYSIZE(pin_options));
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::PopID();
+    }
+
+
+
+    ImGui::NextColumn();
+
+    if (chip_texture) {
+        float display_height = 350.0f;  // desired display height
+        float aspect_ratio = (float)chip_img_width / chip_img_height;
+        float display_width = display_height * aspect_ratio;
+
+        //ImGui::Dummy(ImVec2(50, 20));
+        ImGui::Dummy(ImVec2(0, pin_start_offset * (dropdown_height + 5)));
+        ImGui::Image(chip_texture, ImVec2(display_width, display_height));
+    }
+    else {
+        ImGui::Text("Chip image not loaded.");
+    }
+
+
+    ImGui::NextColumn();
+
+    // Right pins: Top to bottom, descending pin numbers (e.g., 32 → 17)
+    ImGui::Dummy(ImVec2(0, pin_start_offset * (dropdown_height + 5)));  // shift down
+
+    for (int i = 0; i < selected_pin_count / 2; ++i) {
+        int logical_pin_number = selected_pin_count - i;
+        int pin_index = TOTAL_PINS - 1 - i - pin_start_offset;
+
+
+        ImGui::PushID(pin_index);
+
+        // Top-most right pin becomes fixed VCC
+        if (i == 0) {
+            ImVec4 vccColor = getColorForLabel("VCC");
+            ImGui::PushStyleColor(ImGuiCol_Text, vccColor);
+            ImGui::BeginDisabled();
+
+            int dummy_index = 0;
+            ImGui::Combo(("Pin " + std::to_string(logical_pin_number)).c_str(), &dummy_index, "VCC");
+
+            ImGui::EndDisabled();
+            ImGui::PopStyleColor();
+
+            //selected_pin_function[pin_index] = -2;  // Optional: mark as fixed VCC internally
+        }
+        else {
+            ImVec4 color = getColorForLabel(pin_options[selected_pin_function[pin_index]]);
+            ImGui::PushStyleColor(ImGuiCol_Text, color);
+            ImGui::Combo(("Pin " + std::to_string(logical_pin_number)).c_str(), &selected_pin_function[pin_index], pin_options, IM_ARRAYSIZE(pin_options));
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::PopID();
+    }
+
+    ImGui::Columns(1);
+
+    ImGui::Separator();
+    std::string status = get_chip_configuration_status();
+    ImGui::TextColored(
+        status.rfind("Valid", 0) == 0 ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+        "%s", status.c_str()
+    );
+
+
+    ImGui::EndChild();
+    ImGui::End();
+
+    ImGui::SetNextWindowSize(ImVec2(600, 250), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Teensy Log");
+
+    if (ImGui::Button("Clear Log")) {
+        std::lock_guard<std::mutex> lock(teensy_log_mutex);
+        teensy_log_lines.clear();
+    }
+    ImGui::Separator();
+
+    ImGui::BeginChild("LogScrollRegion", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    {
+        std::lock_guard<std::mutex> lock(teensy_log_mutex);
+        for (const auto& line : teensy_log_lines) {
+            ImGui::TextUnformatted(line.c_str());
+        }
+
+        if (scroll_to_bottom) {
+            ImGui::SetScrollHereY(1.0f);
+            scroll_to_bottom = false;
+        }
+    }
+    ImGui::EndChild();
+    ImGui::End();
+
+    if (show_teensy_config_popup) {
+        ImGui::SetNextWindowSize(ImVec2(500, 0), ImGuiCond_Always);  // Set width to 500 pixels
+        ImGui::OpenPopup("Teensy Configuration");
+        show_teensy_config_popup = false;
+    }
+
+    if (ImGui::BeginPopupModal("Teensy Configuration", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", teensy_config_response.c_str());
+        if (ImGui::Button("OK")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+
+    if (breakpoint_pending_rebuild) {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - breakpoint_trigger_timestamp
+            ).count();
+
+        if (elapsed >= 500) {
+            streaming_mode_enabled = false;
+            teensy_streaming.store(false);
+            current_time_counter.store(breakpoint_trigger_time);  // 👈 set the slider position
+            rebuild_memory_state_up_to(breakpoint_trigger_time);
+            std::cout << "[Breakpoint] Rebuilt memory at counter " << breakpoint_trigger_time << "\n";
+            user_overridden_slider = true; // 👈 prevent auto-follow after breakpoint
+            breakpoint_triggered = false;
+            breakpoint_pending_rebuild = false;
+        }
+    }
+}
 
 
 int main(int argc, char* argv[]) {
@@ -969,1088 +2055,42 @@ int main(int argc, char* argv[]) {
     while (!quit) {
         SDL_Event event;
 
-        // Wait for an event instead of polling constantly
+        bool shouldRender = false;
         SDL_WaitEvent(&event);
         ImGui_ImplSDL2_ProcessEvent(&event);
 
-        if (event.type == SDL_QUIT) {
+        switch (event.type) {
+        case SDL_QUIT:
             quit = true;
+        case SDL_KEYDOWN:
+        case SDL_KEYUP:
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+        case SDL_MOUSEWHEEL:
+        case SDL_WINDOWEVENT:
+            shouldRender = true;
+            break;
+        case SDL_MOUSEMOTION: {
+            static auto last_motion_render = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (now - last_motion_render > std::chrono::milliseconds(16)) {  // ~60fps
+                shouldRender = true;
+                last_motion_render = now;
+            }
+            break;
+        }
+        default:
+            break;
         }
 
-        //while (SDL_PollEvent(&event)) {
-        //    ImGui_ImplSDL2_ProcessEvent(&event);
-        //    if (event.type == SDL_QUIT) quit = true;
-        //}
-
-        ImGui_ImplSDLRenderer2_NewFrame();
-        ImGui_ImplSDL2_NewFrame();
-        ImGui::NewFrame();
-
-        static bool trigger_save_popup = false;
-        static bool trigger_load_popup = false;
-
-        // Render only when needed
-        bool shouldRender = true;
-
-        if (ImGui::BeginMainMenuBar()) {
-            if (ImGui::BeginMenu("Project")) {
-                if (ImGui::MenuItem("Save Project")) {
-                    std::cout << "open" << "\n";
-                    trigger_save_popup = true;
-                    //ImGui::OpenPopup("SaveProjectPopup");
-                }
-                if (ImGui::MenuItem("Load Project")) {
-                    std::cout << "open" << "\n";
-                    trigger_load_popup = true;
-                    ImGui::OpenPopup("LoadProjectPopup");
-                }
-                ImGui::EndMenu();
-            }
-            ImGui::EndMainMenuBar();
-        }
-
-        if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S)) || trigger_save_popup) {
-            ImGui::OpenPopup("SaveProjectPopup");
-            trigger_save_popup = false;
-        }
-        if ((io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L)) || trigger_load_popup) {
-            ImGui::OpenPopup("LoadProjectPopup");
-            trigger_load_popup = false;
-        }
-
-
-        // Save Project popup
-        static char project_name_input[64] = "NewProject";
-        if (ImGui::BeginPopupModal("SaveProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            // Handle ESC key
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                ImGui::CloseCurrentPopup();
-            }
-
-            ImGui::InputText("Project Name", project_name_input, IM_ARRAYSIZE(project_name_input));
-            if (ImGui::Button("Save")) {
-                save_project(project_name_input);
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-        }
-
-        ImGui::SetNextWindowSize(ImVec2(650, 0), ImGuiCond_Appearing);  // width = 250, height = auto
-        if (ImGui::BeginPopupModal("LoadProjectPopup", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            static std::vector<std::string> project_dirs;
-            static bool need_reload = true;
-
-            // Handle ESC key
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-                // Your cancel logic here (e.g. clear state, reset vars)
-                need_reload = true;
-                ImGui::CloseCurrentPopup();
-            }
-
-            if (need_reload) {
-                project_dirs.clear();
-                WIN32_FIND_DATAA ffd;
-                HANDLE hFind = FindFirstFileA("projects\\*", &ffd);
-                if (hFind != INVALID_HANDLE_VALUE) {
-                    do {
-                        if ((ffd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                            strcmp(ffd.cFileName, ".") != 0 &&
-                            strcmp(ffd.cFileName, "..") != 0) {
-                            project_dirs.push_back(ffd.cFileName);
-                        }
-                    } while (FindNextFileA(hFind, &ffd));
-                    FindClose(hFind);
-                }
-                need_reload = false;
-            }
-
-            for (const std::string& dir : project_dirs) {
-                if (ImGui::Selectable(dir.c_str())) {
-                    load_project(dir);
-                    ImGui::CloseCurrentPopup();
-                    need_reload = true;
-                }
-            }
-
-            if (ImGui::Button("Cancel")) {
-                ImGui::CloseCurrentPopup();
-                need_reload = true;
-            }
-            ImGui::EndPopup();
-        }
-
-
-
-        ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
-        ImGui::Begin("Memory view");
-
-
-
-        if (ImGui::Button("Save bin file")) {
-            strcpy_s(unknown_byte_input, "FF");  // Default fill for unknown
-            show_save_bin_popup = true;
-            ImGui::OpenPopup("Save Memory to Bin");
-        }
-
-        if (ImGui::BeginPopupModal("Save Memory to Bin", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-
-            ImGui::Text("Enter hex value to replace unknown (??) bytes:");
-            ImGui::InputText("Hex byte", unknown_byte_input, IM_ARRAYSIZE(unknown_byte_input), ImGuiInputTextFlags_CharsHexadecimal);
-
-            if (ImGui::Button("Proceed")) {
-                unsigned int fill_byte = 0xFF;
-                sscanf_s(unknown_byte_input, "%x", &fill_byte);
-
-                std::string full_filename = chip_name;
-                full_filename += "_spied.bin";  // simpler concatenation
-
-                char filename[MAX_PATH] = {};
-                strncpy_s(filename, sizeof(filename), full_filename.c_str(), _TRUNCATE);
-
-                OPENFILENAMEA ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner = NULL;
-                ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
-                ofn.lpstrFile = filename;
-                ofn.nMaxFile = MAX_PATH;
-                ofn.lpstrInitialDir = ".";
-                ofn.lpstrTitle = "Save Memory Dump";
-                ofn.Flags = OFN_OVERWRITEPROMPT;
-                ofn.lpstrDefExt = "bin";  // <- ensures .bin gets added if user omits it
-
-
-                if (GetSaveFileNameA(&ofn)) {
-                    std::string path = ofn.lpstrFile;
-                    // Ensure the extension is .bin
-                    if (path.size() < 4 || path.substr(path.size() - 4) != ".bin") {
-                        path += ".bin";
-                    }
-
-                    std::ofstream file(path, std::ios::binary);
-
-
-                    if (file) {
-                        for (size_t i = 0; i < MEMORY_SIZE; ++i) {
-                            uint8_t b = memory_written[i] ? memory_data[i] : static_cast<uint8_t>(fill_byte);
-                            file.write(reinterpret_cast<const char*>(&b), 1);
-                        }
-                        file.close();
-                    }
-                }
-
-                show_save_bin_popup = false;
-                ImGui::CloseCurrentPopup();
-            }
-
-            ImGui::SameLine();
-            if (ImGui::Button("Cancel")) {
-                show_save_bin_popup = false;
-                ImGui::CloseCurrentPopup();
-            }
-            ImGui::EndPopup();
-        }
-
-
-        uint64_t min_counter = 0;
-        uint64_t max_counter = 0;
-        {
-            std::lock_guard<std::mutex> lock(packet_mutex);
-            if (!full_transaction_log.empty())
-                max_counter = full_transaction_log.back().counter;
-        }
-
-        //if (!user_overridden_slider && streaming_mode_enabled) {
-        //    current_time_counter = max_counter;
-        //    rebuild_memory_state_up_to(current_time_counter);
-        //}
-
-        uint64_t temp_counter = current_time_counter.load();
-        if (ImGui::SliderScalar("Time", ImGuiDataType_U64, &temp_counter, &min_counter, &max_counter)) {
-            user_overridden_slider = true;
-            current_time_counter.store(temp_counter);
-            rebuild_memory_state_up_to(temp_counter);
-        }
-
-        ImGui::SameLine();
-        if (ImGui::ArrowButton("##back", ImGuiDir_Left)) {
-            uint64_t t = current_time_counter.load();
-            if (t > 0) {
-                t--;
-                current_time_counter.store(t);
-                rebuild_memory_state_up_to(t);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::ArrowButton("##forward", ImGuiDir_Right)) {
-            uint64_t t = current_time_counter.load();
-            if (t < max_counter) {
-                t++;
-                current_time_counter.store(t);
-                rebuild_memory_state_up_to(t);
-            }
-        }
-
-        ImGui::BeginChild("HexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
-        if (scroll_to_recent_address && !recent_addresses.empty()) {
-            int latest_addr = recent_addresses.back();
-            float line_height = ImGui::GetTextLineHeightWithSpacing();
-            float scroll_y = (latest_addr / 16) * line_height;
-            ImGui::SetScrollY(scroll_y - ImGui::GetWindowHeight() * 0.5f);  // Center on it
-            scroll_to_recent_address = false;
-        }
-
-        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-        ImGui::PushFont(ImGui::GetFont());
-
-        ImVec2 charSize = ImGui::CalcTextSize("FF");  // Approx width of 2 hex chars
-
-        // Header
-        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Offset(h)");
-        ImGui::SameLine(70);
-        for (int col = 0; col < 16; ++col) {
-            char col_label[4];
-            snprintf(col_label, sizeof(col_label), "%02X", col);
-            ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%s", col_label);
-            if (col != 15) ImGui::SameLine();
-        }
-
-        // ASCII header
-        float ascii_start_x = 70 + 16 * (charSize.x + 6) + 25;
-        ImGui::SetCursorPosX(ascii_start_x);
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Decoded text");
-
-        // Hex + ASCII rows
-        for (size_t row = 0; row < MEMORY_SIZE; row += 16) {
-            ImGui::Text("%08X", static_cast<unsigned int>(row));
-            ImGui::SameLine(70);
-
-            for (int col = 0; col < 16; ++col) {
-                size_t addr = row + col;
-                if (addr >= MEMORY_SIZE) continue;
-
-                bool is_recent = false;
-                int recent_index = -1;
-
-                for (int i = 0; i < recent_addresses.size(); ++i) {
-                    if (recent_addresses[i] == addr) {
-                        is_recent = true;
-                        recent_index = i;
-                        break;
-                    }
-                }
-
-                if (memory_written[addr]) {
-                    if (is_recent) {
-                        static const ImVec4 red_shades[10] = {
-                            ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-                            ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
-                            ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
-                            ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
-                        };
-                        ImVec4 shade = red_shades[9 - std::min(recent_index, 9)];
-                        ImGui::TextColored(shade, "%02X", memory_data[addr]);
-                    }
-                    else {
-                        ImVec4 color;
-                        switch (memory_color[addr]) {
-                        case MemColor::READ: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break; // white
-                        case MemColor::WRITE: color = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); break; // green
-                        case MemColor::FOREIGN: color = ImVec4(0.8f, 0.4f, 1.0f, 1.0f); break; // purple
-                        default: color = ImVec4(1.0f, 1.0f, 1.0f, 1.0f); break;
-                        }
-                        ImGui::TextColored(color, "%02X", memory_data[addr]);
-                    }
-                }
-                else {
-                    ImGui::TextDisabled("??");
-                }
-
-                if (col != 15) ImGui::SameLine();
-            }
-
-
-            // ASCII preview
-            ImGui::SameLine(ascii_start_x);
-            for (int col = 0; col < 16; ++col) {
-                size_t addr = row + col;
-                char c = ' ';
-                if (addr < MEMORY_SIZE && memory_written[addr]) {
-                    c = memory_data[addr];
-                    if (c < 32 || c > 126) c = '.';
-                }
-                ImGui::Text("%c", c);
-                if (col != 15) ImGui::SameLine();
-            }
-        }
-
-        ImGui::PopFont();
-        ImGui::PopStyleVar();
-        ImGui::EndChild();
-        ImGui::End();
-
-
-        ImGui::SetNextWindowSize(ImVec2(500, 700), ImGuiCond_Once);
-        ImGui::Begin("Packet Monitor");
-
-        if (ImGui::BeginCombo("Serial Port", port_labels.empty() ? "" : port_labels[selected_port_index].c_str())) {
-            for (int i = 0; i < port_labels.size(); i++) {
-                bool is_selected = (selected_port_index == i);
-                if (ImGui::Selectable(port_labels[i].c_str(), is_selected)) {
-                    selected_port_index = i;
-                }
-                if (is_selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::Button("Refresh Ports")) {
-            available_ports = enumerate_serial_ports(port_labels);
-            if (!available_ports.empty()) {
-                selected_port_index = std::min(selected_port_index, static_cast<int>(available_ports.size() - 1));
-            }
-            else {
-                selected_port_index = 0;
-            }
-        }
-
-        ImGui::SameLine();
-        if (!serial_thread_running && (!available_ports.empty() ? ImGui::Button("Connect") : (ImGui::BeginDisabled(), ImGui::Button("Connect")) && (ImGui::EndDisabled(), false))) {
-            try {
-                port.close();
-                port.open(available_ports[selected_port_index].c_str());
-                port.set_option(serial_port::baud_rate(2000000));
-                port.set_option(serial_port::flow_control(serial_port::flow_control::none));
-                port.set_option(serial_port::character_size(8));
-                port.set_option(serial_port::parity(serial_port::parity::none));
-                port.set_option(serial_port::stop_bits(serial_port::stop_bits::one));
-                running = true;
-                serial_thread_running = true;
-                reader = std::thread(serial_thread_func);
-            }
-            catch (const std::exception& e) {
-                std::cerr << "Failed to open port: " << e.what() << std::endl;
-            }
-        }
-        if (serial_thread_running && ImGui::Button("Disconnect")) {
-            running = false;
-
-            asio::error_code ec;
-
-            if (port.is_open()) {
-                port.cancel(ec); // cancel pending read
-                port.close(ec);  // closes port
-            }
-
-            if (reader.joinable()) {
-                reader.join();  // thread will exit due to ec from read_some
-            }
-
-            context.restart();  // reset asio for reuse
-        }
-
-
-
-        if (serial_thread_running) {
-            ImGui::SameLine();
-            if (teensy_streaming.load()) ImGui::BeginDisabled();
-
-            //ImGui::SameLine();
-            if (ImGui::Button("Send Config")) {
-                int we_teensy = -1, oe_teensy = -1, cs_teensy = -1;
-
-
-                std::vector<std::pair<std::string, int>> address_pins;
-                std::vector<std::pair<std::string, int>> data_pins;
-
-                for (int i = 0; i < TOTAL_PINS; ++i) {
-                    int pin_idx = selected_pin_function[i];
-                    if (pin_idx < 0 || pin_idx >= IM_ARRAYSIZE(pin_options)) continue;
-
-                    std::string label = pin_options[pin_idx];
-
-                    int chip_pin = i + 1;
-                    if (selected_pin_count == 30) chip_pin -= 1;
-                    else if (selected_pin_count == 28) chip_pin -= 2;
-
-                    int teensy_pin = chip_pinnumber_to_teensy_pin(chip_pin, selected_pin_count);
-
-                    if (label == "/WE") we_teensy = teensy_pin;
-                    else if (label == "/OE") oe_teensy = teensy_pin;
-                    else if (label == "/CS") cs_teensy = teensy_pin;
-                    else if (label.rfind("A", 0) == 0) address_pins.emplace_back(label, teensy_pin);
-                    else if (label.rfind("D", 0) == 0) data_pins.emplace_back(label, teensy_pin);
-                }
-
-                if (we_teensy != -1 || oe_teensy != -1) {
-                    int mode = selected_mode;
-                    int freq = selected_freq_khz * 1000;
-                    int xtal_freq = xtal_freq_mhz * 1000000;
-
-                    // Sort A and D pins by label (A1 < A2 < A3, D1 < D2 < D3 ...)
-                    std::sort(address_pins.begin(), address_pins.end(), [](const auto& a, const auto& b) {
-                        return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
-                        });
-
-                    std::sort(data_pins.begin(), data_pins.end(), [](const auto& a, const auto& b) {
-                        return std::stoi(a.first.substr(1)) < std::stoi(b.first.substr(1));
-                        });
-
-                    std::string addrs = "ADDRS=";
-                    for (size_t i = 0; i < address_pins.size(); ++i) {
-                        if (i > 0) addrs += ",";
-                        addrs += std::to_string(address_pins[i].second);
-                    }
-
-                    std::string datas = "DATAS=";
-                    for (size_t i = 0; i < data_pins.size(); ++i) {
-                        if (i > 0) datas += ",";
-                        datas += std::to_string(data_pins[i].second);
-                    }
-
-                    std::string config_cmd = "CFG WE=" + std::to_string(we_teensy) +
-                        " OE=" + std::to_string(oe_teensy) +
-                        " CS=" + std::to_string(cs_teensy) +
-                        " MODE=" + std::to_string(mode) +
-                        " FREQ=" + std::to_string(freq) +
-                        " XTAL=" + std::to_string(xtal_freq) +
-                        " IDLE=" + std::to_string(cpu_idle_behavior) +
-                        " " + addrs +
-                        " " + datas +
-                        " NAME=" + chip_name + "\n";
-
-
-                    teensy_write(config_cmd);
-                }
-                else {
-                    std::cerr << "Missing both /WE and /OE pin assignments!\n";
-                }
-            }
-
-
-
-            ImGui::SameLine();
-            if (ImGui::Button("Get Config")) {
-                teensy_write("GETCFG");
-            }
-
-            if (teensy_streaming.load()) ImGui::EndDisabled();
-
-            if (!teensy_streaming.load()) {
-                if (ImGui::Button("Start Streaming")) {
-                    setup_active_gpio_bits();
-                    streaming_mode_enabled = true;
-                    teensy_write("START");
-                    teensy_streaming.store(true);
-                }
-
-                ImGui::SameLine();
-
-                ImGui::SetNextItemWidth(120);
-                ImGui::InputInt("##step_count", &step_count);
-                if (step_count < 1) step_count = 1;
-
-                ImGui::SameLine();
-
-                if (ImGui::Button("Step")) {
-                    std::string cmd = "STEP_" + std::to_string(step_count) + "\n";
-                    teensy_write(cmd);
-                    step_mode_enabled = true;  // 👈 Enable step mode
-                }
-
-                ImGui::Checkbox("Enable Streaming Breakpoint", &breakpoint_enabled);
-
-                ImGui::Text("Stop if packet matches:");
-                ImGui::SameLine();
-                ImGui::Text("Operation:");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                ImGui::Combo("##op", &breakpoint_op, "Both\0READ\0WRITE\0");
-
-                ImGui::SameLine();
-                ImGui::Text("Chip:");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
-                ImGui::Combo("##chip", &breakpoint_chip, "Both\0This chip\0Foreign\0");
-
-                ImGui::Text("Address (hex):");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
-                ImGui::InputText("##addr", breakpoint_address_hex, IM_ARRAYSIZE(breakpoint_address_hex), ImGuiInputTextFlags_CharsHexadecimal);
-
-                ImGui::SameLine();
-                ImGui::Text("Value (hex):");
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
-                ImGui::InputText("##val", breakpoint_value_hex, IM_ARRAYSIZE(breakpoint_value_hex), ImGuiInputTextFlags_CharsHexadecimal);
-
-
-                if (ImGui::Button("Reset CPU")) {
-                    std::string cmd = "RESET_CPU \n";
-                    teensy_write(cmd);
-                }
-            }
-
-            else {
-                if (ImGui::Button("Stop Streaming")) {
-                    streaming_mode_enabled = false; // Disable binary parsing
-                    teensy_write("STOP");
-                    teensy_streaming.store(false);
-                    rebuild_memory_state_up_to(current_time_counter);
-                }
-
-                // Draw buffer backlog status dot
-                {
-                    size_t buffer_size = packet_buffer.size();
-                    const size_t warning_threshold = 500;
-
-                    ImVec4 dot_color = (buffer_size > warning_threshold)
-                        ? ImVec4(1.0f, 0.2f, 0.2f, 1.0f)  // Red
-                        : ImVec4(0.2f, 1.0f, 0.2f, 1.0f); // Green
-                    ImGui::SameLine();
-                    ImGui::Text("Buffer Status: ");
-                    ImGui::SameLine();
-                    ImGui::ColorButton("##buffer_dot", dot_color, ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoDragDrop, ImVec2(12, 12));
-
-                    ImGui::SameLine();
-                    ImGui::Text("%s", buffer_size > warning_threshold ? "Backlog detected" : "Healthy");
-                }
-
-            }
-            ImGui::NewLine();
-
-            if (ImGui::Button("Save MT file")) {
-                char filename[MAX_PATH] = {};
-                strcpy_s(filename, "transactions.mt");
-
-                OPENFILENAMEA ofn = {};
-                ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner = NULL;
-                ofn.lpstrFilter = "Memory Transactions\0*.mt\0All Files\0*.*\0";
-                ofn.lpstrFile = filename;
-                ofn.nMaxFile = MAX_PATH;
-                ofn.lpstrTitle = "Save Memory Transactions";
-                ofn.lpstrDefExt = "mt";
-                ofn.Flags = OFN_OVERWRITEPROMPT;
-
-                if (GetSaveFileNameA(&ofn)) {
-                    std::ifstream temp_in(temp_mt_log_filename, std::ios::binary);
-                    std::ofstream perm_out(ofn.lpstrFile, std::ios::binary);
-                    perm_out << temp_in.rdbuf();
-                }
-            }
-            ImGui::SameLine();
-
-            if (ImGui::Button("Clear All Data")) {
-                {
-                    std::lock_guard<std::mutex> lock(packet_mutex);
-                    packet_buffer.clear();
-                    full_transaction_log.clear();
-                }
-
-                // Clear memory contents and flags
-                std::fill(std::begin(memory_data), std::end(memory_data), 0);
-                std::fill(std::begin(memory_written), std::end(memory_written), false);
-                std::fill(std::begin(memory_written_by_write_op), std::end(memory_written_by_write_op), false);
-                std::fill(std::begin(memory_color), std::end(memory_color), MemColor::NONE);
-
-                // Clear snapshots and recent addresses
-                memory_snapshots.clear();
-                recent_addresses.clear();
-                scroll_to_recent_address = false;
-
-                // Reset counters
-                total_bytes = 0;
-                total_packets = 0;
-                valid_packets = 0;
-                read_count = 0;
-                write_count = 0;
-                ignored_chip_packets = 0;
-
-                // Reset time travel state
-                current_time_counter.store(0);
-                user_overridden_slider = false;
-
-                // Reset temp MT log file
-                if (mt_log_file.is_open()) {
-                    mt_log_file.close();
-                    mt_log_file.open(temp_mt_log_filename, std::ios::out | std::ios::trunc);
-                }
-            }
-
-
-        }
-
-
-        static auto last_stats_time = std::chrono::high_resolution_clock::now();
-        static double mbps = 0.0;
-        static double mean_us = 0.0;
-        static uint64_t last_valid_packet_count = 0;
-
-        auto now = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(now - last_stats_time).count();
-
-        if (elapsed >= 1.0) {
-            mbps = (total_bytes * 8.0) / (elapsed * 1e6); // Megabits per second
-            total_bytes = 0;
-
-            uint64_t delta_packets = valid_packets - last_valid_packet_count;
-            last_valid_packet_count = valid_packets;
-
-            mean_us = (delta_packets > 0) ? (elapsed * 1e6) / delta_packets : 0.0;
-            last_stats_time = now;
-        }
-        ImGui::NewLine();
-        ImGui::Text("Transfer Rate: %.2f Mbps", mbps);
-        ImGui::Text("Avg Time Between Ops: %.2f us", mean_us);
-        // Line 1: Total packets
-        ImGui::Text("Total packets %llu : %llu valid | %llu invalid",
-            total_packets, valid_packets, total_packets - valid_packets);
-
-        // Line 2: Valid packets with green "Writes"
-        ImGui::Text("Valid packets %llu :", valid_packets);
-        ImGui::SameLine();
-        ImGui::Text("Reads %llu |", read_count);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 1.0f, 0.3f, 1.0f));  // Green
-        ImGui::Text("Writes %llu", write_count);
-        ImGui::PopStyleColor();
-
-        // Line 3: Local vs Foreign with purple "Foreign"
-        ImGui::Text("Local packets: %llu |", valid_packets - ignored_chip_packets);
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.4f, 1.0f, 1.0f));  // Purple
-        ImGui::Text("Foreign packets: %llu", ignored_chip_packets);
-        ImGui::PopStyleColor();
-
-        ImGui::Separator();
-        ImGui::BeginChild("ScrollRegion", ImVec2(0, 200), true);
-
-        static const ImVec4 red_shades[10] = {
-            ImVec4(1.0f, 0.0f, 0.0f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f), ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
-            ImVec4(1.0f, 0.4f, 0.4f, 1.0f), ImVec4(1.0f, 0.5f, 0.5f, 1.0f), ImVec4(1.0f, 0.6f, 0.6f, 1.0f),
-            ImVec4(1.0f, 0.7f, 0.7f, 1.0f), ImVec4(1.0f, 0.8f, 0.8f, 1.0f), ImVec4(1.0f, 0.9f, 0.9f, 1.0f),
-            ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
-        };
-
-        std::lock_guard<std::mutex> lock(packet_mutex);
-
-        size_t total = full_transaction_log.size();
-        int shown = 0;
-        for (int i = static_cast<int>(total) - 1; i >= 0 && shown < 10; --i) {
-            if (full_transaction_log[i].counter <= current_time_counter) {
-                const Packet& pkt = full_transaction_log[i];
-
-                // Determine red intensity based on recent_addresses
-                int recent_index = -1;
-                for (int j = 0; j < static_cast<int>(recent_addresses.size()); ++j) {
-                    if (recent_addresses[j] == pkt.address) {
-                        recent_index = j;
-                        break;
-                    }
-                }
-
-                // Format base line
-                char line[128];
-                snprintf(line, sizeof(line), "%llu | %s | 0x%X | 0x%X%s",
-                    pkt.counter,
-                    pkt.op.c_str(),
-                    pkt.address,
-                    pkt.value,
-                    pkt.foreign_chip ? " | foreign" : ""
-                );
-
-                if (recent_index != -1) {
-                    ImVec4 color = red_shades[9 - std::min(recent_index, 9)];
-                    ImGui::TextColored(color, "%s", line);
-                }
-                else {
-                    ImGui::Text("%s", line);
-                }
-
-                ++shown;
-            }
-        }
-
-
-        ImGui::EndChild();
-        ImGui::End();
-
-        ImGui::SetNextWindowSize(ImVec2(700, 700), ImGuiCond_Once);
-        ImGui::Begin("Read/Write Memory");
-
-        // Optional: Add Write/Modify UI later here
-        if (ImGui::Button("Read chip memory")) {
-            teensy_write("READ_0x0000_0x00");
-            std::fill(std::begin(read_memory_data), std::end(read_memory_data), 0xFF);
-        }
-
-
-        ImGui::SameLine();
-
-        if (ImGui::Button("Write chip memory")) {
-            try {
-                const size_t MAX_CHUNK_SIZE = 500;
-                constexpr size_t TOTAL_SIZE = sizeof(read_memory_data);  // 65536 for 64KB
-
-                size_t base_addr = 0;
-
-                while (base_addr < TOTAL_SIZE) {
-                    size_t chunk_len = std::min(MAX_CHUNK_SIZE, TOTAL_SIZE - base_addr);
-
-                    // Convert chunk to hex string
-                    std::string hex_data;
-                    hex_data.reserve(chunk_len * 2);
-                    for (size_t i = 0; i < chunk_len; ++i) {
-                        char hex_byte[3];
-                        snprintf(hex_byte, sizeof(hex_byte), "%02X", read_memory_data[base_addr + i]);
-                        hex_data += hex_byte;
-                    }
-
-                    // Construct command
-                    char cmd[64];
-                    snprintf(cmd, sizeof(cmd), "WRITE_0x%06zX_%zu_", base_addr, chunk_len);
-                    std::string full_cmd = cmd + hex_data;
-
-                    // Send to Teensy
-                    teensy_write(full_cmd);
-
-                    base_addr += chunk_len;
-                    break;  // prevent further chunks
-                }
-
-                log_teensy_message("Write complete from pc!", true);
-            }
-            catch (const std::exception& e) {
-                log_teensy_message(std::string("Write failed: ") + e.what(), false);
-            }
-        }
-
-
-        //ImGui::NewLine();
-        if (ImGui::Button("Save Readout to Bin")) {
-            char filename[MAX_PATH] = {};
-            strcpy_s(filename, "chip_readout.bin");
-
-            OPENFILENAMEA ofn = {};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner = NULL;
-            ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
-            ofn.lpstrFile = filename;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.lpstrInitialDir = ".";
-            ofn.lpstrTitle = "Save Readout";
-            ofn.Flags = OFN_OVERWRITEPROMPT;
-            ofn.lpstrDefExt = "bin";
-
-            if (GetSaveFileNameA(&ofn)) {
-                std::ofstream file(ofn.lpstrFile, std::ios::binary);
-                if (file) {
-                    file.write(reinterpret_cast<const char*>(read_memory_data), MEMORY_SIZE);
-                    file.close();
-                }
-            }
-        }
-
-
-        static int edit_byte_addr = -1;
-        static char hex_input[5] = "";
-        bool open_edit_popup = false;
-
-        // Load File Button
-        if (ImGui::Button("Load file into memory")) {
-            char filename[MAX_PATH] = {};
-            OPENFILENAMEA ofn = {};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrFilter = "Binary files\0*.bin\0All files\0*.*\0";
-            ofn.lpstrFile = filename;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.lpstrTitle = "Select a file to load";
-            ofn.Flags = OFN_FILEMUSTEXIST;
-
-            if (GetOpenFileNameA(&ofn)) {
-                std::ifstream in(filename, std::ios::binary);
-                if (in) {
-                    std::vector<uint8_t> buffer(std::istreambuf_iterator<char>(in), {});
-                    size_t len = std::min(buffer.size(), static_cast<size_t>(MEMORY_SIZE));
-                    std::copy(buffer.begin(), buffer.begin() + len, read_memory_data);
-                }
-            }
-        }
-
-
-        ImGui::BeginChild("ReadMemoryHexViewer", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
-
-        // Header
-        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "Offset(h)");
-        ImGui::SameLine(70);
-        for (int col = 0; col < 16; ++col) {
-            char col_label[4];
-            sprintf_s(col_label, "%02X", col);
-            ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%s", col_label);
-            if (col != 15) ImGui::SameLine();
-        }
-
-        // Layout calculations
-        ImVec2 cell_size = ImVec2(ImGui::CalcTextSize("FF").x + 2.0f, ImGui::GetTextLineHeight());
-        float rw_ascii_start_x = 70 + 16 * (cell_size.x + 6.0f) + 25;
-
-        // Memory viewer rows
-        for (size_t row = 0; row < MEMORY_SIZE; row += 16) {
-            ImGui::Text("%08X", static_cast<unsigned int>(row));
-            ImGui::SameLine(70);
-
-            for (int col = 0; col < 16; ++col) {
-                size_t addr = row + col;
-                char label[4];
-                sprintf_s(label, "%02X", read_memory_data[addr]);
-
-                ImGui::Text("%s", label);
-                if (col != 15) ImGui::SameLine();
-            }
-
-            // ASCII view
-            ImGui::SameLine(rw_ascii_start_x);
-            for (int col = 0; col < 16; ++col) {
-                size_t addr = row + col;
-                char c = (read_memory_data[addr] >= 32 && read_memory_data[addr] <= 126) ? read_memory_data[addr] : '.';
-                ImGui::Text("%c", c);
-                if (col != 15) ImGui::SameLine();
-            }
-        }
-
-        ImGui::EndChild();
-        ImGui::End();
-
-
-        ImGui::SetNextWindowSize(ImVec2(600, 700), ImGuiCond_Once);
-        ImGui::Begin("Chip Configuration");
-
-        ImGui::InputText("Chip Name", &chip_name[0], 64);
-        ImGui::RadioButton("28 pins", &selected_pin_count, 28); ImGui::SameLine();
-        ImGui::RadioButton("30 pins", &selected_pin_count, 30); ImGui::SameLine();
-        ImGui::RadioButton("32 pins", &selected_pin_count, 32);
-        ImGui::Separator();
-
-        // New Input: Onboard XTAL frequency in MHz
-        ImGui::Text("Onboard XTAL Frequency:");
-        ImGui::InputInt("MHz", &xtal_freq_mhz);
-        if (xtal_freq_mhz < 0.1f) xtal_freq_mhz = 0.1f;
-
-        // New Option: What CPU should do if not streaming
-        //static int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
-        ImGui::Text("If not streaming CPU should:");
-        ImGui::RadioButton("not run (0 Hz clk)", &cpu_idle_behavior, 0); ImGui::SameLine();
-        ImGui::RadioButton("run at XTAL frequency", &cpu_idle_behavior, 1);
-
-        ImGui::Text("Streaming Frequency (max. 70kHz) :");
-        ImGui::InputInt("kHz", &selected_freq_khz);
-        if (selected_freq_khz < 1) selected_freq_khz = 1;
-
-        ImGui::Text("Capture Mode:");
-        ImGui::RadioButton("Interrupt", &selected_mode, 0); ImGui::SameLine();
-        ImGui::RadioButton("Continuous", &selected_mode, 1);
-
-        if (ImGui::Button("Save Config")) save_config_to_json();
-        ImGui::SameLine();
-        if (ImGui::Button("Load Config")) load_config_from_json();
-
-        ImGui::Separator();
-        ImGui::BeginChild("ChipLayout", ImVec2(0, 600), false);
-        ImGui::Columns(3, NULL, false);
-
-        ImVec4 vccColor = ImVec4(1.0f, 0.2f, 0.2f, 1.0f);   // Red
-        ImVec4 gndColor = ImVec4(1.0f, 1.0f, 1.0f, 1.0f);   // White
-
-
-        ImVec4 addrColor = ImVec4(0.8f, 0.8f, 0.1f, 1.0f);
-        ImVec4 dataColor = ImVec4(0.2f, 0.9f, 0.3f, 1.0f);
-        ImVec4 ctrlColor = ImVec4(0.3f, 0.5f, 0.9f, 1.0f);
-        ImVec4 ncColor = ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
-
-        auto getColorForLabel = [&](const std::string& label) {
-            if (label == "NC") return ncColor;
-            if (label == "VCC") return vccColor;
-            if (label == "GND") return gndColor;
-            if (label == "/CS" || label == "/WE" || label == "/OE") return ctrlColor;
-            if (label.rfind("A", 0) == 0) return addrColor;
-            if (label.rfind("D", 0) == 0) return dataColor;
-            return ImVec4(1, 1, 1, 1);  // default white
-        };
-
-
-
-        // Calculate vertical shift based on removed top pins
-        float dropdown_height = ImGui::GetTextLineHeightWithSpacing();
-        int pin_start_offset = (32 - selected_pin_count) / 2;
-        ImGui::Dummy(ImVec2(0, pin_start_offset* (dropdown_height + 5)));
-
-        // Render visible left-side pins (1 to N/2)
-        for (int i = 0; i < selected_pin_count / 2; ++i) {
-            int pin_index = i + pin_start_offset;
-
-            ImGui::PushID(pin_index);
-
-            // Last pin in left column becomes fixed GND
-            if (i == (selected_pin_count / 2 - 1)) {
-                // Force this pin to be GND (index 2 in pin_options)
-                selected_pin_function[pin_index] = 2;
-
-                ImVec4 gndColor = getColorForLabel("GND");
-                ImGui::PushStyleColor(ImGuiCol_Text, gndColor);
-                ImGui::BeginDisabled();
-                
-                int dummy_index = 0;
-                ImGui::Combo(("Pin " + std::to_string(i + 1)).c_str(), &dummy_index, "GND");
-
-
-                ImGui::EndDisabled();
-                ImGui::PopStyleColor();
-
-                selected_pin_function[pin_index] = -1;  // Optional: Mark internally as GND (not from dropdown options)
-            }
-            else {
-                ImVec4 color = getColorForLabel(pin_options[selected_pin_function[pin_index]]);
-                ImGui::PushStyleColor(ImGuiCol_Text, color);
-                ImGui::Combo(("Pin " + std::to_string(i + 1)).c_str(), &selected_pin_function[pin_index], pin_options, IM_ARRAYSIZE(pin_options));
-                ImGui::PopStyleColor();
-            }
-
-            ImGui::PopID();
-        }
-
-
-
-        ImGui::NextColumn();
-
-        // Middle image
-        //if (chip_texture) {
-
-
-        if (chip_texture) {
-            float display_height = 350.0f;  // desired display height
-            float aspect_ratio = (float)chip_img_width / chip_img_height;
-            float display_width = display_height * aspect_ratio;
-
-            //ImGui::Dummy(ImVec2(50, 20));
-            ImGui::Dummy(ImVec2(0, pin_start_offset * (dropdown_height + 5)));
-            ImGui::Image(chip_texture, ImVec2(display_width, display_height));
-        }
-        else {
-            ImGui::Text("Chip image not loaded.");
-        }
-
-
-        ImGui::NextColumn();
-
-        // Right pins: Top to bottom, descending pin numbers (e.g., 32 → 17)
-        ImGui::Dummy(ImVec2(0, pin_start_offset * (dropdown_height + 5)));  // shift down
-
-        for (int i = 0; i < selected_pin_count / 2; ++i) {
-            int logical_pin_number = selected_pin_count - i;
-            int pin_index = TOTAL_PINS - 1 - i - pin_start_offset;
-
-
-            ImGui::PushID(pin_index);
-
-            // Top-most right pin becomes fixed VCC
-            if (i == 0) {
-                ImVec4 vccColor = getColorForLabel("VCC");
-                ImGui::PushStyleColor(ImGuiCol_Text, vccColor);
-                ImGui::BeginDisabled();
-
-                int dummy_index = 0;
-                ImGui::Combo(("Pin " + std::to_string(logical_pin_number)).c_str(), &dummy_index, "VCC");
-
-                ImGui::EndDisabled();
-                ImGui::PopStyleColor();
-
-                //selected_pin_function[pin_index] = -2;  // Optional: mark as fixed VCC internally
-            }
-            else {
-                ImVec4 color = getColorForLabel(pin_options[selected_pin_function[pin_index]]);
-                ImGui::PushStyleColor(ImGuiCol_Text, color);
-                ImGui::Combo(("Pin " + std::to_string(logical_pin_number)).c_str(), &selected_pin_function[pin_index], pin_options, IM_ARRAYSIZE(pin_options));
-                ImGui::PopStyleColor();
-            }
-
-            ImGui::PopID();
-        }
-
-
-
-
-
-        ImGui::Columns(1);
-
-        ImGui::Separator();
-        std::string status = get_chip_configuration_status();
-        ImGui::TextColored(
-            status.rfind("Valid", 0) == 0 ? ImVec4(0.3f, 1.0f, 0.3f, 1.0f) : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
-            "%s", status.c_str()
-        );
-
-
-        ImGui::EndChild();
-        ImGui::End();
-
-        ImGui::SetNextWindowSize(ImVec2(600, 250), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Teensy Log");
-
-        if (ImGui::Button("Clear Log")) {
-            std::lock_guard<std::mutex> lock(teensy_log_mutex);
-            teensy_log_lines.clear();
-        }
-        ImGui::Separator();
-
-        ImGui::BeginChild("LogScrollRegion", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
-        {
-            std::lock_guard<std::mutex> lock(teensy_log_mutex);
-            for (const auto& line : teensy_log_lines) {
-                ImGui::TextUnformatted(line.c_str());
-            }
-
-            if (scroll_to_bottom) {
-                ImGui::SetScrollHereY(1.0f);
-                scroll_to_bottom = false;
-            }
-        }
-        ImGui::EndChild();
-        ImGui::End();
-
-        if (show_teensy_config_popup) {
-            ImGui::SetNextWindowSize(ImVec2(500, 0), ImGuiCond_Always);  // Set width to 500 pixels
-            ImGui::OpenPopup("Teensy Configuration");
-            show_teensy_config_popup = false;
-        }
-
-        if (ImGui::BeginPopupModal("Teensy Configuration", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::TextWrapped("%s", teensy_config_response.c_str());
-            if (ImGui::Button("OK")) ImGui::CloseCurrentPopup();
-            ImGui::EndPopup();
-        }
-
-
-        if (breakpoint_pending_rebuild) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - breakpoint_trigger_timestamp
-                ).count();
-
-            if (elapsed >= 500) {
-                streaming_mode_enabled = false;
-                teensy_streaming.store(false);
-                current_time_counter.store(breakpoint_trigger_time);  // 👈 set the slider position
-                rebuild_memory_state_up_to(breakpoint_trigger_time);
-                std::cout << "[Breakpoint] Rebuilt memory at counter " << breakpoint_trigger_time << "\n";
-                user_overridden_slider = true; // 👈 prevent auto-follow after breakpoint
-                breakpoint_triggered = false;
-                breakpoint_pending_rebuild = false;
-            }
-        }
-
-        // Only proceed if rendering is required
         if (shouldRender) {
+            ImGui_ImplSDLRenderer2_NewFrame();
+            ImGui_ImplSDL2_NewFrame();
+            ImGui::NewFrame();
+
+            render_gui();  // ✅ only call when inside a valid frame
+
+
             ImGui::Render();
             SDL_RenderClear(renderer);
             ImGui_ImplSDLRenderer2_RenderDrawData(ImGui::GetDrawData(), renderer);
