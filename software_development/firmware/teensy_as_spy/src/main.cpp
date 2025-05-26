@@ -21,10 +21,8 @@
 #define EXTRA_PIN_3 36
 #define HIGH_SPEED_CLK_ACTIVE_LED 33
 
-#define MEMORY_CHIP_WRITE_DELAY_MS 5 // Needs a lot time ms vs us because we drive signals through 330R resistors!! (min. value = 5ms), maybe better without leds on WE signal?
+#define MEMORY_CHIP_WRITE_DELAY_MS 10 // Needs a lot time ms vs us because we drive signals through 330R resistors!! (min. value = 5ms), maybe better without leds on WE signal?
 #define MEMORY_CHIP_READ_DELAY_US 10
-
-
 
 enum RunMode : uint8_t {
   INTERRUPT_MODE = 0,
@@ -62,16 +60,48 @@ volatile bool dataset_ready = false;
 IntervalTimer sample_timer;
 
 EXTMEM uint8_t psram_buffer[1 << 18];  // 2^18 = 262144 bytes = 256 KB
+uint8_t temp_buf[1024];  // temporary buffer for memory writes
 
+// Global reusable packet buffer with static prefix pre-filled
+uint8_t gpio_packet_buffer[10] = { '>', 0xFF };  // Remaining 8 bytes will be filled with gpio64
+volatile bool instruction_transmitted = false;
 
 FASTRUN void handle_memory_access() {
-  if (Serial.availableForWrite() >= 8) {
-    uint32_t gpio6 = GPIO6_DR;
-    uint32_t gpio7 = GPIO7_DR;
-    Serial.write((uint8_t*)&gpio6, 4);
-    Serial.write((uint8_t*)&gpio7, 4);
+  if (Serial.availableForWrite() >= 10) {  // needs 10, not 8
+    uint64_t gpio64 = ((uint64_t)GPIO7_DR << 32) | GPIO6_DR;
+    memcpy(&gpio_packet_buffer[2], &gpio64, 8);
+    Serial.write(gpio_packet_buffer, 10);
+    instruction_transmitted = true;
   }
 }
+
+// FASTRUN void spy_to_psram() {
+//   uint64_t gpio64 = ((uint64_t)GPIO7_DR << 32) | GPIO6_DR;
+
+//   // Check access condition first
+//   bool cs_low = !(gpio64 & pin_mask_table[config.cs_pin]);
+//   bool we_low = !(gpio64 & pin_mask_table[config.we_pin]);
+//   bool oe_low = !(gpio64 & pin_mask_table[config.oe_pin]);
+
+//   if (!(cs_low && (we_low || oe_low))) return;
+
+//   uint32_t address = 0;
+//   for (uint8_t i = 0; i < config.address_count; ++i) {
+//     if (gpio64 & pin_mask_table[config.address_pins[i]])
+//       address |= (1UL << i);
+//   }
+
+//   uint8_t data = 0;
+//   for (uint8_t i = 0; i < config.data_count; ++i) {
+//     if (gpio64 & pin_mask_table[config.data_pins[i]])
+//       data |= (1 << i);
+//   }
+
+//   if (psram_buffer[address] != data)
+//     psram_buffer[address] = data;
+// }
+
+
 
 void continuous_sample() {
   handle_memory_access();
@@ -214,7 +244,7 @@ uint8_t read_single_address(uint32_t addr){
   // Serial.print("Reading address ");
   // Serial.print(String(addr));
 
-  if(!setup_for_reading_writing_chip(true))return;
+  if(!setup_for_reading_writing_chip(false))return;
 
   set_memory_address(addr);
 
@@ -231,23 +261,8 @@ uint8_t read_single_address(uint32_t addr){
   return value;
 }
 
-void read_partial_memory(uint32_t start_addr, uint32_t length) {
+void send_partial_memory_from_psram(uint32_t start_addr, uint32_t length){
   const size_t MAX_DATA_PER_PACKET = 500;
-  uint32_t max_address = (1UL << config.address_count);
-
-  // Default to full memory size if length == 0
-  if (length == 0) {
-    length = max_address - start_addr;
-  }
-
-  if (start_addr + length > max_address) {
-    send_pc('I', "ERROR: Out of bounds");
-    return;
-  }
-
-  if(!setup_for_reading_writing_chip(true))return;
-
-  digitalWriteFast(config.oe_pin, LOW); // enable reading from chip
 
   uint32_t addr = start_addr;
   while (addr < start_addr + length) {
@@ -262,22 +277,49 @@ void read_partial_memory(uint32_t start_addr, uint32_t length) {
 
     for (size_t i = 0; i < chunk_len; ++i) {
       uint32_t curr_addr = addr + i;
-      set_memory_address(curr_addr);
-      delayMicroseconds(MEMORY_CHIP_READ_DELAY_US);
-      uint8_t value = read_memory_value();
-      Serial.println(value);
-      buf[4 + i] = value;
+      buf[4 + i] = psram_buffer[curr_addr];
     }
 
+    delay(10);
     send_pc('R', buf, 4 + chunk_len);
     addr += chunk_len;
   }
 
-  close_memory_power_and_set_pins_high_impedance();
-
   char buf[64];
   snprintf(buf, sizeof(buf), "done reading %lu bytes from address 0x%lX", length, start_addr);
   send_pc('I', String(buf));
+
+}
+
+void read_partial_memory(uint32_t start_addr, uint32_t length) {
+  
+  uint32_t max_address = (1UL << config.address_count);
+
+  // Default to full memory size if length == 0
+  if (length == 0) {
+    length = max_address - start_addr;
+  }
+
+  if (start_addr + length > max_address) {
+    send_pc('I', "ERROR: Out of bounds");
+    return;
+  }
+
+  if(!setup_for_reading_writing_chip(false))return;
+
+  digitalWriteFast(config.oe_pin, LOW); // enable reading from chip
+
+  uint32_t addr = start_addr;
+  while (addr < start_addr + length) {
+    set_memory_address(addr);
+    delayMicroseconds(MEMORY_CHIP_READ_DELAY_US);
+    psram_buffer[addr] = read_memory_value();
+    addr++;
+  }
+
+  close_memory_power_and_set_pins_high_impedance();
+
+  send_partial_memory_from_psram(start_addr, length);
 }
 
 void write_single_address(uint32_t addr, const uint8_t value){
@@ -299,7 +341,7 @@ void write_single_address(uint32_t addr, const uint8_t value){
   close_memory_power_and_set_pins_high_impedance();
 }
 
-void write_partial_memory(uint32_t start_addr, const uint8_t* data, uint32_t length) {
+void write_partial_memory_old(uint32_t start_addr, const uint8_t* data, uint32_t length) {
   uint32_t max_address = (1UL << config.address_count);
 
   if (start_addr + length > max_address) {
@@ -327,6 +369,61 @@ void write_partial_memory(uint32_t start_addr, const uint8_t* data, uint32_t len
   }
 
   close_memory_power_and_set_pins_high_impedance();
+
+  char msg[64];
+  snprintf(msg, sizeof(msg), "WROTE %lu bytes to address 0x%lX", length, start_addr);
+  send_pc('I', String(msg));
+}
+
+void psram_to_chip_write() {
+  uint32_t max_address = (1UL << config.address_count);
+
+  if (!setup_for_reading_writing_chip(true)) return;
+
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], OUTPUT);
+
+  // Send initial progress update
+  send_pc('I', "<0> % writing done");
+
+  const uint32_t chunk_size = 512;
+  for (uint32_t curr_addr = 0; curr_addr < max_address; ++curr_addr) {
+    set_memory_address(curr_addr);
+    digitalWriteFast(config.we_pin, LOW);  // enable writing to chip
+    set_memory_value(psram_buffer[curr_addr]);
+    delay(MEMORY_CHIP_WRITE_DELAY_MS);     // hold WE low for write time
+    digitalWriteFast(config.we_pin, HIGH);
+    delay(MEMORY_CHIP_WRITE_DELAY_MS);
+
+    // Progress feedback every 512 bytes
+    if ((curr_addr + 1) % chunk_size == 0 || (curr_addr + 1) == max_address) {
+      uint32_t percent = ((curr_addr + 1) * 100UL) / max_address;
+      char buf[32];
+      snprintf(buf, sizeof(buf), "<%lu> %% writing done", percent);
+      send_pc('I', buf);
+    }
+  }
+
+  close_memory_power_and_set_pins_high_impedance();
+
+  send_pc('I', "writing done!");
+}
+
+
+void write_partial_memory(uint32_t start_addr, const uint8_t* data, uint32_t length) {
+  uint32_t max_address = (1UL << config.address_count);
+
+  if (start_addr + length > max_address) {
+    send_pc('I', "ERROR: Write out of bounds");
+    return;
+  }
+
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], OUTPUT);
+
+  for (uint32_t i = 0; i < length; ++i) {
+    psram_buffer[start_addr + i] = data[i];
+  }
 
   char msg[64];
   snprintf(msg, sizeof(msg), "WROTE %lu bytes to address 0x%lX", length, start_addr);
@@ -593,6 +690,51 @@ void handle_get_config() {
   
 }
 
+void perform_clock_cycles(int target_count, bool wait_for_access_flag) {
+  digitalWriteFast(RUNNING_PIN, HIGH);
+  pinMode(EXT_CLK_PIN, OUTPUT);
+  digitalWrite(DEBUG_SPEED_CLK_ACTIVE_LED, HIGH);
+  digitalWrite(HIGH_SPEED_CLK_ACTIVE_LED, LOW);
+
+  if (config.we_pin != (uint8_t)-1)
+    attachInterrupt(digitalPinToInterrupt(config.we_pin), handle_memory_access, FALLING);
+  if (config.oe_pin != (uint8_t)-1)
+    attachInterrupt(digitalPinToInterrupt(config.oe_pin), handle_memory_access, FALLING);
+
+  unsigned long half_period_us = 500000UL / config.freq;
+  int count = 0;
+
+  while (count < target_count) {
+    digitalWriteFast(EXT_CLK_PIN, HIGH);
+    delayMicroseconds(half_period_us);
+    digitalWriteFast(EXT_CLK_PIN, LOW);
+    delayMicroseconds(half_period_us);
+
+    if (wait_for_access_flag) {
+      delay(10);
+      if (instruction_transmitted) {
+        instruction_transmitted = false;
+        count++;
+      }
+    } else {
+      count++;
+    }
+  }
+
+  if (config.we_pin != (uint8_t)-1)
+    detachInterrupt(digitalPinToInterrupt(config.we_pin));
+  if (config.oe_pin != (uint8_t)-1)
+    detachInterrupt(digitalPinToInterrupt(config.oe_pin));
+
+  // uint64_t marker = 0xFFFFFFFFFFFFFFFFULL;
+  // Serial.write((uint8_t*)&marker, 8);
+  send_pc('A', "STEPS DONE");
+  enter_idle_mode();
+  delay(100);
+  send_pc('I', "STEPS DONE");
+}
+
+
 void setup() {
   Serial.begin(2000000);
   Serial.setTimeout(200);  // <- Set timeout only once here
@@ -620,35 +762,70 @@ void setup() {
   enter_idle_mode();
   send_pc('I', "PMT Leech BOOTED");
 
-  static uint8_t temp_buf[5];  // Can write up to 1024 bytes
+  // static uint8_t temp_buf[5];  // Can write up to 1024 bytes
 
-  for (uint32_t i = 0; i < 5; ++i) {
-    temp_buf[i] = 6;
-  }
-
-  write_partial_memory(0, temp_buf, 5);
-  read_partial_memory(0, 5);
-
-  for (uint32_t i = 0; i < 5; ++i) {
-    temp_buf[i] = 255;
-  }
-
-  write_partial_memory(0, temp_buf, 5);
-  read_partial_memory(0, 5);
-
-  for (uint32_t i = 0; i < 5; ++i) {
-    temp_buf[i] = 0;
-  }
-
-  write_partial_memory(0, temp_buf, 5);
-  read_partial_memory(0, 5);
-
-  // for(int i = 0; i < 2000; i++){
-  //   write_single_address(0, i);
-  //   read_single_address(0);
+  // for (uint32_t i = 0; i < 5; ++i) {
+  //   temp_buf[i] = 6;
   // }
 
+  // write_partial_memory(0, temp_buf, 5);
+  // read_partial_memory(0, 5);
+
+  // for (uint32_t i = 0; i < 5; ++i) {
+  //   temp_buf[i] = 255;
+  // }
+
+  // write_partial_memory(0, temp_buf, 5);
+  // read_partial_memory(0, 5);
+
+  // for (uint32_t i = 0; i < 5; ++i) {
+  //   temp_buf[i] = 0;
+  // }
+
+  // write_partial_memory(0, temp_buf, 5);
+  // read_partial_memory(0, 5);
+
+  // // for(int i = 0; i < 2000; i++){
+  // //   write_single_address(0, i);
+  // //   read_single_address(0);
+  // // }
+
 }
+
+void handle_write_binary(const uint8_t* data, uint16_t len) {
+
+  if (len < 10) {
+    send_pc('I', "ERROR: Packet too short");
+    return;
+  }
+
+  if (state != IDLE) {
+    send_pc('I', "ERROR: Not in IDLE");
+    return;
+  }
+
+  uint32_t addr = ((uint32_t)data[5] << 16) |
+                  ((uint32_t)data[6] << 8) |
+                  ((uint32_t)data[7]);
+
+  uint16_t length = ((uint16_t)data[8] << 8) |
+                    ((uint16_t)data[9]);
+
+  if (length > 1024) {
+    send_pc('I', "ERROR: Max 1024 bytes");
+    return;
+  }
+
+  if (len < 10 + length) {
+    send_pc('I', "ERROR: Incomplete WRITE data");
+    return;
+  }
+
+  memcpy(temp_buf, &data[10], length);
+  write_partial_memory(addr, temp_buf, length);
+  send_pc('I', "WRITE OK");
+}
+
 
 void handle_command(const String& serial_buffer) {
   if (serial_buffer == "START" && state == IDLE) {
@@ -666,37 +843,15 @@ void handle_command(const String& serial_buffer) {
     pinMode(RESET_CPU_PIN, INPUT);
     send_pc('X', "ACK RESET_CPU");
   } else if (serial_buffer.startsWith("STEP_")) {
-    int steps = serial_buffer.substring(5).toInt();
-    if (steps <= 0) steps = 1;
+      int steps = serial_buffer.substring(5).toInt();
+      if (steps <= 0) steps = 1;
+      perform_clock_cycles(steps, false);
 
-    digitalWriteFast(RUNNING_PIN, HIGH);
-    pinMode(EXT_CLK_PIN, OUTPUT);
-    digitalWrite(DEBUG_SPEED_CLK_ACTIVE_LED, HIGH);
-    digitalWrite(HIGH_SPEED_CLK_ACTIVE_LED, LOW);
-
-    if (config.we_pin != (uint8_t)-1)
-      attachInterrupt(digitalPinToInterrupt(config.we_pin), handle_memory_access, FALLING);
-    if (config.oe_pin != (uint8_t)-1)
-      attachInterrupt(digitalPinToInterrupt(config.oe_pin), handle_memory_access, FALLING);
-
-    unsigned long half_period_us = 500000UL / config.freq;
-    for (int i = 0; i < steps; ++i) {
-      digitalWriteFast(EXT_CLK_PIN, HIGH);
-      delayMicroseconds(half_period_us);
-      digitalWriteFast(EXT_CLK_PIN, LOW);
-      delayMicroseconds(half_period_us);
-    }
-
-    if (config.we_pin != (uint8_t)-1)
-      detachInterrupt(digitalPinToInterrupt(config.we_pin));
-    if (config.oe_pin != (uint8_t)-1)
-      detachInterrupt(digitalPinToInterrupt(config.oe_pin));
-
-    uint64_t marker = 0xFFFFFFFFFFFFFFFFULL;
-    Serial.write((uint8_t*)&marker, 8);
-    enter_idle_mode();
-    delay(100);
-    send_pc('I',"STEPS DONE");
+  }  else if (serial_buffer.startsWith("INSTR_")) {
+      int instructions_to_perform = serial_buffer.substring(6).toInt(); // "INSTR_" is 6 chars
+      if (instructions_to_perform <= 0) instructions_to_perform = 1;
+      instruction_transmitted = false;
+      perform_clock_cycles(instructions_to_perform, true);
 
   } else if (serial_buffer.startsWith("READ_") && state == IDLE) {
     int sep1 = serial_buffer.indexOf('_', 5);
@@ -708,41 +863,8 @@ void handle_command(const String& serial_buffer) {
       read_partial_memory(start_addr, length);
     }
   
-  } 
-  else if (serial_buffer.startsWith("WRITE_") && state == IDLE) {
-    int pos1 = serial_buffer.indexOf('_', 5);
-    int pos2 = serial_buffer.indexOf('_', pos1 + 1);
-    int pos3 = serial_buffer.indexOf('_', pos2 + 1);
-  
-    if (pos1 == -1 || pos2 == -1 || pos3 == -1) {
-      send_pc('I', "ERROR: Invalid WRITE format");
-      return;
-    }
-  
-    String addr_str = serial_buffer.substring(5, pos2);
-    String len_str = serial_buffer.substring(pos2 + 1, pos3);
-    String hex_str = serial_buffer.substring(pos3 + 1);
-  
-    uint32_t addr = strtoul(addr_str.c_str(), nullptr, 0);
-    uint32_t length = strtoul(len_str.c_str(), nullptr, 0);
-  
-    if (hex_str.length() != length * 2) {
-      send_pc('I', "ERROR: Hex length mismatch");
-      return;
-    }
-  
-    static uint8_t temp_buf[1024];  // Can write up to 1024 bytes
-    if (length > sizeof(temp_buf)) {
-      send_pc('I', "ERROR: Max 1024 bytes");
-      return;
-    }
-  
-    for (uint32_t i = 0; i < length; ++i) {
-      char byte_str[3] = { hex_str[i * 2], hex_str[i * 2 + 1], 0 };
-      temp_buf[i] = strtoul(byte_str, nullptr, 16);
-    }
-  
-    write_partial_memory(addr, temp_buf, length);
+  } else if (serial_buffer.startsWith("PSRAM_TO_CHIP_WRITE") && state == IDLE) {
+    psram_to_chip_write();
   }
   else if (serial_buffer == "DUMP" && state == IDLE) {
     dump_memory_to_sd();
@@ -776,26 +898,33 @@ FASTRUN void loop() {
       return;
     }
 
-    String serial_buffer;
-    serial_buffer.reserve(payload_len);
+    uint8_t buffer[1024];
     for (uint16_t i = 0; i < payload_len; ++i) {
       int ch = Serial.read();
       if (ch == -1) {
         send_pc('U', "TIMEOUT: only " + String(i) + " of " + String(payload_len) + " bytes received");
         return;
       }
-      serial_buffer += (char)ch;
+      buffer[i] = (uint8_t)ch;
     }
 
-    serial_buffer.trim();
-    handle_command(serial_buffer);
+    if (payload_len >= 5 &&
+        buffer[0] == 'W' && buffer[1] == 'R' &&
+        buffer[2] == 'I' && buffer[3] == 'T' &&
+        buffer[4] == 'E') {
+      handle_write_binary(buffer, payload_len);
+    } else {
+      // Treat as ASCII command
+      String ascii_cmd = "";
+      for (int i = 0; i < payload_len; ++i) ascii_cmd += (char)buffer[i];
+      ascii_cmd.trim();
+      handle_command(ascii_cmd);
+    }
+
   }
 
-  if (state == RUNNING && config.mode == CONTINUOUS_MODE && Serial.availableForWrite() >= 8) {
-    uint32_t gpio6 = GPIO6_DR;
-    uint32_t gpio7 = GPIO7_DR;
-    Serial.write((uint8_t*)&gpio6, 4);
-    Serial.write((uint8_t*)&gpio7, 4);
+  if (state == RUNNING && config.mode == CONTINUOUS_MODE) {
+      handle_memory_access();
   }
 
   static uint32_t last_addr = 0xFFFFFFFF;
