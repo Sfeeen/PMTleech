@@ -1,63 +1,183 @@
-# PMT leech
-#### A Parellel Memory Transactions monitor
+# 🚀 PMT Leech
+#### A Parallel Memory Transactions Monitor
 
-PMT leech is a tool which can help you to view the memory addresses and values accessed by a CPU to an external parallel memory chip. 
-By attaching the PMTLeech with a clipper to your memorychip and providing our own clock signal to the CPU we can live stream the transactions
-that happen. Being in control over the clock signal allows us to also pause and step through the firmware. 
+<p align="center">
+  <img src="/PMTLeech_concept.drawio.png?raw=true" alt="PMT Leech Concept" title="PMT Leech PCB" width="600"/>
+</p>
 
-Generally this tool can be mainly used for older electronics because of the two main requirements:
-- A parallel memory chip must be used
-- The CPU must run on an external clock source
+**PMT Leech** is a hardware + software tool that lets you monitor live memory accesses from a CPU to an external parallel memory chip.  
+It streams transactions in real-time, while giving you full control over the system clock — allowing **pausing, stepping, and instruction-level debugging**.
 
-# Working concept:
-todo add reset connection
-<img src="/PMTLeech_concept.drawio.png?raw=true" alt="3D view of PMT leech PCB" title="PMT leech PCB" width="500"/>
+---
 
-# Software:
-<img src="/PMTLeech_software.png?raw=true" alt="3D view of PMT leech PCB" title="PMT leech PCB" width="1000"/>
+## 🔧 When Should You Use PMT Leech?
 
-### Software features:
-- Configuration of your parallel memory chip
-- Live recording of all transactions at up to 70Khz
-- Stepping through a recording with color highlighting
-- Perform Instruction step(s) or Clock step(s) (An instruction can be 1 or more clock cycles)
-- Also view/record foreign packets: reads/write when the /CS of the chip you attach to was not low.
-- Read/Write your whole memory chip out circuit (with the socket on PMT Leech)
+PMT Leech is especially useful when working with **older electronic systems** that meet these two conditions:
+- ✅ The system uses a **parallel memory chip** (like SRAM or EPROM)
+- ✅ The CPU operates with an **external clock input**
 
-# Demo:
-(to be added)
+---
 
-# Total requirements:
-- A parallel memory chip is used
-  - with max. 8 data bits
-  - with max. 18 address lines
-  - works on 5V (330R series resistance protection if not the case)
-- CPU
-  - Uses external clock signal as its main clock source
-  - works on 5V (330R series resistance protection if not the case)
-- PCB
-  - Has no external interactions which are time critical. The CPU will be underclocked. Example: if the CPU has a 8Mhz clock and uses UART at 9600baud, the PMT Leech is configured to provide a 50Khz clock so the actual UART is at 60baud or doesn't work
-  
-# In circuit clippers:
-(add link)
+## ⚙️ How It Works
 
-<img src="clipper.jpg?raw=true" alt="3D view of PMT leech PCB" title="PMT leech PCB" width="500"/>
+By attaching PMT Leech to your memory chip (via clipper) and supplying your own clock signal to the CPU:
+- You gain **live streaming** of memory transactions
+- You can **pause or step** through firmware execution  
+- You can **reverse engineer or debug** embedded firmware in a safe, controlled way
 
+---
 
-# External Parallel memory types:
+## 🧰 Hardware Overview
+
+<p float="left">
+  <img src="3D_view_PMTLeech.png?raw=true" alt="PMT Leech PCB" title="PMT Leech PCB" width="300"/>
+  <img src="image_PMT_leech_hardware_in_use.png?raw=true" alt="PMT Leech In Use" title="In Use" width="300"/>
+</p>
+
+---
+
+## 🖥️ Software Features
+
+<p align="center">
+  <img src="/PMTLeech_software.png?raw=true" alt="PMT Leech Software" title="Software UI" width="1000"/>
+</p>
+
+- 🧩 Configurable pinout: Supports 28, 30, or 32-pin chips
+- 📡 Live recording of transactions (up to 70kHz)
+- 🎨 Interactive memory viewer with color-coded highlights
+- ⏱ Step by **clock** or **instruction**
+- 🧠 Detect and label **foreign packets** (from other devices on the memory bus)
+- 💾 Off-circuit memory read/write with chip socket
+
+---
+
+## 🎞️ Demo
+
+<p align="center">
+  <img src="Animation.gif" alt="Demo Animation" title="PMT Leech Demo" width="800"/>
+</p>
+
+---
+
+## 📋 Requirements
+
+### ✅ Memory Chip
+- Parallel bus
+- ≤ 8-bit data
+- ≤ 18 address lines
+- 5V compatible (or use 330Ω series resistors)
+
+### ✅ CPU
+- Must allow external clock input
+- 5V compatible (or 330Ω resistors)
+
+### ⚠️ Note on Timing
+The CPU will be **underclocked** (e.g., 8 MHz → 50 kHz). This may affect peripherals like UART:
+- Ex: 9600 baud becomes ~60 baud — comms may break.
+
+---
+
+## 🧲 In-Circuit Clip Options
+
+- [📄 3M Test Clip Brochure (PDF)](research/in%20circuit%20connection%20to%20chips/Test%20Clip%20Brochure%203M.pdf)
+
+<p float="left">
+  <img src="research/in%20circuit%20connection%20to%20chips/test_clips.png?raw=true" alt="3M Clips" width="400"/>
+  <img src="clipper.jpg?raw=true" alt="Clipper Photo" width="400"/>
+</p>
+
+---
+
+## 🧠 Supported Memory Types
+
 - EEPROM
 - EPROM
-- SRAM : PMT Leech is extra usefull PCB's where the firmware is programmed in SRAM. This was done often in the early days because SRAM is much faster than (E)EPROM but it is volatile so you can not (easily) read this memory using a chip reader
-- ...
+- SRAM — **especially valuable** for volatile firmware systems
 
-# Example use cases
-- An old HMI has a password in its UI to use the program. The firmware inside the HMI is programmed in a SRAM memory chip. You attach the PMT Leech, record the transactions during the input and verification of the password. You might see the password appear in the hexviewer or if you know the CPU type you might decode the instructions and interpret the perform logic. (add image)
-- Controlled brownout glitching during critical steps of firmware execution (follow: https://github.com/Sfeeen/Siemens-Advanced-Operator-Panel) 
+💡 Many older systems used **SRAM for firmware** due to speed advantages. PMT Leech lets you read these **volatile** setups **without desoldering**.
 
-# Licensing:
-(to be added)
+---
 
-# Buying / Building the hardware
-(to be added) / mailto: svenonderbeke %at% hotmail %dot% com
-# Development: PMT Leech dev. board 
-<img src="/hardware_development/3Dview_PMT_leech.png?raw=true" alt="3D view of PMT leech PCB" title="PMT leech PCB" width="1000"/>
+## 🔍 Example Use Cases
+
+- **Bypass password protection**: Record firmware transactions during password validation and discover comparison logic or values.
+- **Firmware reverse engineering**: Step through opcode streams and infer instruction flow.
+- **Brownout glitching**: Control timing to inject faults and analyze behavior.
+  - Related project: [Siemens Advanced Operator Panel](https://github.com/Sfeeen/Siemens-Advanced-Operator-Panel)
+
+---
+
+## 🛠️ Hardware Revisions
+
+### PMT Leech v2 (Current)
+<p align="center">
+  <img src="3D_view_PMTLeech.png?raw=true" alt="PMT Leech v2" width="1000"/>
+</p>
+
+### PMT Leech v1 (Development Stage)
+<p align="center">
+  <img src="/hardware_development/3Dview_PMT_leech.png?raw=true" alt="PMT Leech v1" width="1000"/>
+</p>
+
+---
+
+##
+
+📧 **Contact**: `svenonderbeke [at] hotmail [dot] com`  
+More info to be added soon.
+
+---
+
+### ☕ Support
+
+If you’d like to support the development of PMT Leech, you can donate via Ko-fi:
+[![Buy Me a Coffee](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sventronics)
+
+## 📦 Buying the PMT Leech hardware
+You can order from me: 
+- PMT Leech v2 hardware kit (Finalised PCB + USB cable)
+- DIP-28 clipper with jumper wires
+
+📧 Contact: `svenonderbeke [at] hotmail [dot] com` for pricing.
+
+Buying the hardware from me will support my work since it includes a support/license fee
+
+
+## License 📜 
+
+The **PMT Leech** hardware and software are free to use for **personal, educational, and hobbyist purposes**.
+
+If you're using PMT Leech for:
+- Personal projects  
+- Hobby reverse engineering  
+- Non-commercial research or tinkering  
+
+✅ You're free to:
+- Clone this repo  
+- Build the hardware yourself  
+- Modify and experiment with the source code  
+
+🙏 If you find the project useful, consider making a small **donation** to support continued development.
+
+
+---
+
+### 💼 Commercial or Company Use
+
+If you're:
+- A company  
+- Using PMT Leech for **financial gain**
+
+❗ You are **not permitted** to use the hardware or software for free.
+
+Instead:
+- Please **purchase official PMT Leech hardware** directly from me.  
+- Part of the purchase cost acts as your **license to use PMT Leech commercially**.
+
+📧 Contact: `svenonderbeke [at] hotmail [dot] com` for pricing.
+
+---
+
+## 🧪 Version
+
+**Current Version:** `PMT Leech v2`
