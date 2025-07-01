@@ -24,10 +24,7 @@
 #define MEMORY_CHIP_WRITE_DELAY_MS 10 // Needs a lot time ms vs us because we drive signals through 330R resistors!! (min. value = 5ms), maybe better without leds on WE signal?
 #define MEMORY_CHIP_READ_DELAY_US 10
 
-enum RunMode : uint8_t {
-  INTERRUPT_MODE = 0,
-  CONTINUOUS_MODE = 1
-};
+uint16_t MEMORY_CHIP_WRITE_DELAY_US = 10000;
 
 enum State : uint8_t {
   IDLE = 0,
@@ -39,7 +36,6 @@ struct Config {
   uint8_t we_pin;
   uint8_t oe_pin;
   uint8_t cs_pin; 
-  RunMode mode;
   uint32_t freq;
   uint32_t xtal_freq;
   uint8_t idle_behavior; // 0 = halt, 1 = run at XTAL
@@ -66,6 +62,24 @@ uint8_t temp_buf[1024];  // temporary buffer for memory writes
 uint8_t gpio_packet_buffer[10] = { '>', 0xFF };  // Remaining 8 bytes will be filled with gpio64
 volatile bool instruction_transmitted = false;
 
+uint64_t pin_mask_table[128];
+
+void build_pin_mask_table() {
+  for (int pin = 0; pin < 128; ++pin) {
+    const struct digital_pin_bitband_and_config_table_struct *p = &digital_pin_to_info_PGM[pin];
+    if (!p) continue;
+
+    // Only handle pins in GPIO6 or GPIO7
+    if (p->reg == &GPIO6_DR) {
+      pin_mask_table[pin] = (1ULL << (p->mask ? __builtin_ctz(p->mask) : 0));
+    } else if (p->reg == &GPIO7_DR) {
+      pin_mask_table[pin] = (1ULL << (32 + (p->mask ? __builtin_ctz(p->mask) : 0)));
+    } else {
+      pin_mask_table[pin] = 0; // Unsupported GPIO group
+    }
+  }
+}
+
 FASTRUN void handle_memory_access() {
   if (Serial.availableForWrite() >= 10) {  // needs 10, not 8
     uint64_t gpio64 = ((uint64_t)GPIO7_DR << 32) | GPIO6_DR;
@@ -74,6 +88,45 @@ FASTRUN void handle_memory_access() {
     instruction_transmitted = true;
   }
 }
+
+FASTRUN void handle_memory_access_extracted() {
+  if (Serial.availableForWrite() < 9) return;
+
+  uint64_t gpio64 = ((uint64_t)GPIO7_DR << 32) | GPIO6_DR;
+
+  // Decode control lines
+  bool cs_low = !(gpio64 & pin_mask_table[config.cs_pin]);
+  bool we_low = !(gpio64 & pin_mask_table[config.we_pin]);
+  bool oe_low = !(gpio64 & pin_mask_table[config.oe_pin]);
+
+  // Decode address (18-bit max)
+  uint32_t address = 0;
+  for (uint8_t i = 0; i < config.address_count; ++i) {
+    if (gpio64 & pin_mask_table[config.address_pins[i]])
+      address |= (1UL << i);
+  }
+
+  // Decode data
+  uint8_t data = 0;
+  for (uint8_t i = 0; i < config.data_count; ++i) {
+    if (gpio64 & pin_mask_table[config.data_pins[i]])
+      data |= (1 << i);
+  }
+
+  gpio_packet_buffer[0] = '>';
+  gpio_packet_buffer[1] = 'P';
+  gpio_packet_buffer[2] = cs_low;
+  gpio_packet_buffer[3] = we_low;
+  gpio_packet_buffer[4] = oe_low;
+  gpio_packet_buffer[5] = (address >> 16) & 0xFF;
+  gpio_packet_buffer[6] = (address >> 8) & 0xFF;
+  gpio_packet_buffer[7] = address & 0xFF;
+  gpio_packet_buffer[8] = data;
+
+  Serial.write(gpio_packet_buffer, 9);
+  instruction_transmitted = true;
+}
+
 
 // FASTRUN void spy_to_psram() {
 //   uint64_t gpio64 = ((uint64_t)GPIO7_DR << 32) | GPIO6_DR;
@@ -101,11 +154,10 @@ FASTRUN void handle_memory_access() {
 //     psram_buffer[address] = data;
 // }
 
-
-
-void continuous_sample() {
-  handle_memory_access();
+bool isvalidpin(uint8_t pin){
+  return pin <= 40;
 }
+
 
 void save_config_to_eeprom() {
   EEPROM.write(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
@@ -149,7 +201,6 @@ void load_config_from_eeprom() {
     config.we_pin = 10;
     config.oe_pin = 12;
     config.cs_pin = 11;
-    config.mode = INTERRUPT_MODE;
     config.freq = 70000;
     config.xtal_freq = 16000000;
     config.idle_behavior = 0;
@@ -166,9 +217,10 @@ void load_config_from_eeprom() {
   }
 }
 
-bool setup_for_reading_writing_chip(bool check_we_pin){
+bool setup_for_reading_writing_chip(){
 
-  if(check_we_pin && (config.we_pin == (uint8_t)-1)){
+
+  if(config.we_pin == (uint8_t)-1){
     send_pc('E', "Error WE PIN");
     return false;
   }
@@ -183,9 +235,16 @@ bool setup_for_reading_writing_chip(bool check_we_pin){
     return false;
   }
 
+  pinMode(RESET_CPU_PIN, OUTPUT);
+  digitalWriteFast(RESET_CPU_PIN, LOW);
+
   pinMode(config.cs_pin, OUTPUT);
   pinMode(config.oe_pin, OUTPUT);
   pinMode(config.we_pin, OUTPUT);
+
+  // Serial.println(config.cs_pin);
+  // Serial.println(config.we_pin);
+  // Serial.println(config.oe_pin);
 
   // Make sure we cannot write accidently...
   digitalWriteFast(config.cs_pin, HIGH);
@@ -238,13 +297,15 @@ void close_memory_power_and_set_pins_high_impedance(){
   pinMode(config.oe_pin, INPUT);
   pinMode(config.we_pin, INPUT);
   pinMode(config.cs_pin, INPUT);
+
+  pinMode(RESET_CPU_PIN, INPUT);
 }
 
 uint8_t read_single_address(uint32_t addr){
   // Serial.print("Reading address ");
   // Serial.print(String(addr));
 
-  if(!setup_for_reading_writing_chip(false))return;
+  if(!setup_for_reading_writing_chip())return;
 
   set_memory_address(addr);
 
@@ -305,7 +366,7 @@ void read_partial_memory(uint32_t start_addr, uint32_t length) {
     return;
   }
 
-  if(!setup_for_reading_writing_chip(false))return;
+  if(!setup_for_reading_writing_chip())return;
 
   digitalWriteFast(config.oe_pin, LOW); // enable reading from chip
 
@@ -322,13 +383,32 @@ void read_partial_memory(uint32_t start_addr, uint32_t length) {
   send_partial_memory_from_psram(start_addr, length);
 }
 
+void write_single_address_test(uint32_t addr, const uint8_t value){
+  // Serial.print("Writing address ");
+  // Serial.print(String(addr));
+  // Serial.print(" value: ");
+  // Serial.println(String(value));
+
+  if(!setup_for_reading_writing_chip())return;
+
+  for (uint8_t i = 0; i < config.data_count; ++i)
+    pinMode(config.data_pins[i], OUTPUT);
+
+  set_memory_address(addr);
+  set_memory_value(value);
+
+  digitalWriteFast(config.we_pin, LOW); // enable writing to chip
+  delayMicroseconds(MEMORY_CHIP_WRITE_DELAY_US);  // give a good 10ms to chip so write has certainly happenned // Needs a lot time ms vs us because we drive signals through 330R resistors!!
+  close_memory_power_and_set_pins_high_impedance();
+}
+
 void write_single_address(uint32_t addr, const uint8_t value){
   // Serial.print("Writing address ");
   // Serial.print(String(addr));
   // Serial.print(" value: ");
   // Serial.println(String(value));
 
-  if(!setup_for_reading_writing_chip(true))return;
+  if(!setup_for_reading_writing_chip())return;
 
   for (uint8_t i = 0; i < config.data_count; ++i)
     pinMode(config.data_pins[i], OUTPUT);
@@ -349,7 +429,7 @@ void write_partial_memory_old(uint32_t start_addr, const uint8_t* data, uint32_t
     return;
   }
 
-  if(!setup_for_reading_writing_chip(true))return;
+  if(!setup_for_reading_writing_chip())return;
 
   for (uint8_t i = 0; i < config.data_count; ++i)
     pinMode(config.data_pins[i], OUTPUT);
@@ -378,7 +458,7 @@ void write_partial_memory_old(uint32_t start_addr, const uint8_t* data, uint32_t
 void psram_to_chip_write() {
   uint32_t max_address = (1UL << config.address_count);
 
-  if (!setup_for_reading_writing_chip(true)) return;
+  if (!setup_for_reading_writing_chip()) return;
 
   for (uint8_t i = 0; i < config.data_count; ++i)
     pinMode(config.data_pins[i], OUTPUT);
@@ -517,18 +597,15 @@ void dump_memory_to_sd() {
 }
 
 void enter_running_mode() {
-  if (config.mode == INTERRUPT_MODE) {
-    if (config.we_pin != (uint8_t)-1) {
-      pinMode(config.we_pin, INPUT);
-      attachInterrupt(digitalPinToInterrupt(config.we_pin), handle_memory_access, FALLING);
-    }
-    if (config.oe_pin != (uint8_t)-1) {
-      pinMode(config.oe_pin, INPUT);
-      attachInterrupt(digitalPinToInterrupt(config.oe_pin), handle_memory_access, FALLING);
-    }
-  } else {
-    // sample_timer.begin(continuous_sample, 1000000UL / config.freq);
+  if (config.we_pin != (uint8_t)-1) {
+    pinMode(config.we_pin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(config.we_pin), handle_memory_access, FALLING);
   }
+  if (config.oe_pin != (uint8_t)-1) {
+    pinMode(config.oe_pin, INPUT);
+    attachInterrupt(digitalPinToInterrupt(config.oe_pin), handle_memory_access, FALLING);
+  }
+
   digitalWrite(DEBUG_SPEED_CLK_ACTIVE_LED, HIGH);
   digitalWrite(HIGH_SPEED_CLK_ACTIVE_LED, LOW);
   analogWriteFrequency(EXT_CLK_PIN, config.freq);
@@ -539,13 +616,12 @@ void enter_running_mode() {
 }
 
 void enter_idle_mode() {
-  if (config.mode == INTERRUPT_MODE) {
-    if (config.we_pin != (uint8_t)-1) {
-      detachInterrupt(digitalPinToInterrupt(config.we_pin));
-    }
-    if (config.oe_pin != (uint8_t)-1) {
-      detachInterrupt(digitalPinToInterrupt(config.oe_pin));
-    }
+
+  if (config.we_pin != (uint8_t)-1) {
+    detachInterrupt(digitalPinToInterrupt(config.we_pin));
+  }
+  if (config.oe_pin != (uint8_t)-1) {
+    detachInterrupt(digitalPinToInterrupt(config.oe_pin));
   }
 
   if (config.idle_behavior == 1 && config.xtal_freq > 0) {
@@ -607,14 +683,15 @@ void parse_config_line(const String& line) {
 
 
   if (we != -1) config.we_pin = line.substring(we + 3, line.indexOf(' ', we + 3)).toInt();
+  if(!isvalidpin(config.we_pin))config.we_pin = EXTRA_PIN_4;
   if (oe != -1) config.oe_pin = line.substring(oe + 3, line.indexOf(' ', oe + 3)).toInt();
-  if (mode != -1) config.mode = (RunMode)line.substring(mode + 5, line.indexOf(' ', mode + 5)).toInt();
+  if(!isvalidpin(config.oe_pin))config.oe_pin = EXTRA_PIN_3;
+  if (cs != -1) config.cs_pin = line.substring(cs + 3, line.indexOf(' ', cs + 3)).toInt();
+  if(!isvalidpin(config.cs_pin))config.cs_pin = EXTRA_PIN_2;
   if (freq != -1) config.freq = line.substring(freq + 5, line.indexOf(' ', freq + 5)).toInt();
   if (xtal != -1) config.xtal_freq = line.substring(xtal + 5, line.indexOf(' ', xtal + 5)).toInt();
   if (idle != -1) config.idle_behavior = line.substring(idle + 5, line.indexOf(' ', idle + 5)).toInt();
-  if (cs != -1) config.cs_pin = line.substring(cs + 3, line.indexOf(' ', cs + 3)).toInt();
-
-
+  
   // Parse address pins
   if (addrs != -1) {
     String pinlist = line.substring(addrs + 6, line.indexOf(' ', addrs + 6));
@@ -666,7 +743,6 @@ void handle_get_config() {
   msg += "WE=" + String(config.we_pin);
   msg += " OE=" + String(config.oe_pin);
   msg += " CS=" + String(config.cs_pin);
-  msg += " MODE=" + String(config.mode);
   msg += " FREQ=" + String(config.freq);
   msg += " XTAL=" + String(config.xtal_freq);
   msg += " IDLE=" + String(config.idle_behavior);
@@ -734,6 +810,50 @@ void perform_clock_cycles(int target_count, bool wait_for_access_flag) {
   send_pc('I', "STEPS DONE");
 }
 
+uint16_t find_minimum_write_delay() {
+  const uint32_t test_addr = 0xFFF0;
+  const uint8_t test_values[3] = {0xAA, 0x55, 0xF0};
+  uint16_t low = 1;
+  uint16_t high = 20000;
+  uint16_t result = high;
+
+  while (low <= high) {
+    uint16_t mid = (low + high) / 2;
+    uint8_t read_back[3];
+
+    MEMORY_CHIP_WRITE_DELAY_US = mid;
+    // Serial.println(MEMORY_CHIP_WRITE_DELAY_US);
+    delay(5);
+    // Write and verify
+    bool success = true;
+    for (int i = 0; i < 3; ++i) {
+      write_single_address_test(test_addr, test_values[i]);
+      read_back[i] = read_single_address(test_addr);
+      if (read_back[i] != test_values[i]) {
+        // Serial.print("fail");
+        // Serial.println(MEMORY_CHIP_WRITE_DELAY_US);
+        // Serial.println(read_back[i]);
+        // Serial.println(test_values[i]);
+        success = false;
+        break;
+      } else {
+        // Serial.print("success");
+        // Serial.println(MEMORY_CHIP_WRITE_DELAY_US);
+      }
+    }
+
+    if (success) {
+      result = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  return result;
+}
+
+
 
 void setup() {
   Serial.begin(2000000);
@@ -785,10 +905,17 @@ void setup() {
   // write_partial_memory(0, temp_buf, 5);
   // read_partial_memory(0, 5);
 
-  // // for(int i = 0; i < 2000; i++){
-  // //   write_single_address(0, i);
-  // //   read_single_address(0);
-  // // }
+  // for(int i = 0; i < 2000; i++){
+  //   write_single_address(65520, i);
+  //   read_single_address(65520);
+  // }
+
+  // for(int i = 0; i < 2000; i++){
+  //   MEMORY_CHIP_WRITE_DELAY_US = find_minimum_write_delay();
+  //   char msg[64];
+  //   snprintf(msg, sizeof(msg), "Auto-detected min write delay = %u us", MEMORY_CHIP_WRITE_DELAY_US);
+  //   send_pc('I', msg);
+  // }
 
 }
 
@@ -857,9 +984,13 @@ void handle_command(const String& serial_buffer) {
     int sep1 = serial_buffer.indexOf('_', 5);
     if (sep1 != -1) {
       String addr_str = serial_buffer.substring(5, sep1);
+      Serial.println(addr_str);
       String len_str = serial_buffer.substring(sep1 + 1);
+      Serial.println(len_str);
       uint32_t start_addr = strtoul(addr_str.c_str(), nullptr, 0);
+      Serial.println(String(start_addr));
       uint32_t length = strtoul(len_str.c_str(), nullptr, 0);
+      Serial.println(String(length));
       read_partial_memory(start_addr, length);
     }
   
@@ -921,10 +1052,6 @@ FASTRUN void loop() {
       handle_command(ascii_cmd);
     }
 
-  }
-
-  if (state == RUNNING && config.mode == CONTINUOUS_MODE) {
-      handle_memory_access();
   }
 
   static uint32_t last_addr = 0xFFFFFFFF;

@@ -144,6 +144,8 @@ bool project_selected = false;
 
 std::string project_user_comments;
 
+bool capture_foreign_packets = true;
+
 
 const char* pin_options[] = {
     "NC", "/CS", "/WE", "/OE",
@@ -152,7 +154,6 @@ const char* pin_options[] = {
 };
 constexpr int TOTAL_PINS = 32;
 int selected_pin_function[TOTAL_PINS] = { 0 };  // All default to "NC"
-int selected_mode = 0; // 0 = interrupt, 1 = continuous
 int cpu_idle_behavior = 0; // 0 = halt, 1 = run at XTAL
 int selected_freq_khz = 70; // default frequency in kHz (1 MHz)
 int xtal_freq_mhz = 16;
@@ -223,8 +224,8 @@ int teensy_pin_to_bit_position(int teensy_pin) {
         {18, 17}, // T_GPIO1_17
         {17, 22}, // T_GPIO1_22
         {16, 23}, // T_GPIO1_23
-        {15, 18}, // T_GPIO1_19
-        {14, 19}, // T_GPIO1_18
+        {15, 19}, // T_GPIO1_19
+        {14, 18}, // T_GPIO1_18
         {13, 35}, // T_GPIO2_3
         {41, 21}, // T_GPIO1_21
         {40, 20}, // T_GPIO1_20
@@ -518,7 +519,6 @@ void save_current_project() {
     json meta;
     meta["slider_counter"] = current_time_counter.load();
     meta["xtal_freq_mhz"] = xtal_freq_mhz;
-    meta["selected_mode"] = selected_mode;
     meta["cpu_idle_behavior"] = cpu_idle_behavior;
     meta["selected_freq_khz"] = selected_freq_khz;
     meta["config_filename"] = current_config_filename;
@@ -776,6 +776,13 @@ void serial_thread_func() {
                 uint32_t value = extract_bits(gpio64, active_data_bits);
                 Packet pkt{ ++counter, op, address, value, foreign_chip };
 
+                if (pkt.foreign_chip && !capture_foreign_packets) {
+                    if (mt_log_file.is_open()) {
+                        mt_log_file << pkt.op << " 0x" << std::hex << pkt.address << " 0x" << pkt.value << " foreign" << std::dec << "\n";
+                    }
+                    continue; // Skip adding to buffers and rest of the logic
+                }
+
                 if (breakpoint_enabled && !breakpoint_triggered) {
                     bool match = true;
                     int safe_op = std::clamp(breakpoint_op, 0, 2);
@@ -937,7 +944,6 @@ void save_project(const std::string& project_name) {
     json meta;
     meta["slider_counter"] = current_time_counter.load();
     meta["xtal_freq_mhz"] = xtal_freq_mhz;
-    meta["selected_mode"] = selected_mode;
     meta["cpu_idle_behavior"] = cpu_idle_behavior;
     meta["selected_freq_khz"] = selected_freq_khz;
 
@@ -982,7 +988,6 @@ void load_project(const std::string& project_name) {
 
         if (j.contains("slider_counter")) slider_pos = j["slider_counter"];
         if (j.contains("xtal_freq_mhz")) xtal_freq_mhz = j["xtal_freq_mhz"];
-        if (j.contains("selected_mode")) selected_mode = j["selected_mode"];
         if (j.contains("cpu_idle_behavior")) cpu_idle_behavior = j["cpu_idle_behavior"];
         if (j.contains("selected_freq_khz")) selected_freq_khz = j["selected_freq_khz"];
         if (j.contains("user_comments")) project_user_comments = j["user_comments"];
@@ -1366,7 +1371,6 @@ void send_config() {
     }
 
     if (we_teensy != -1 || oe_teensy != -1) {
-        int mode = selected_mode;
         int freq = selected_freq_khz * 1000;
         int xtal_freq = xtal_freq_mhz * 1000000;
 
@@ -1394,7 +1398,6 @@ void send_config() {
         std::string config_cmd = "CFG WE=" + std::to_string(we_teensy) +
             " OE=" + std::to_string(oe_teensy) +
             " CS=" + std::to_string(cs_teensy) +
-            " MODE=" + std::to_string(mode) +
             " FREQ=" + std::to_string(freq) +
             " XTAL=" + std::to_string(xtal_freq) +
             " IDLE=" + std::to_string(cpu_idle_behavior) +
@@ -1934,6 +1937,7 @@ void render_gui() {
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.4f, 1.0f, 1.0f));  // Purple
     ImGui::Text("Foreign packets: %llu", ignored_chip_packets);
     ImGui::PopStyleColor();
+    ImGui::Checkbox("Capture Foreign Packets", &capture_foreign_packets);
 
     ImGui::Separator();
     ImGui::BeginChild("ScrollRegion", ImVec2(0, 200), true);
@@ -2024,11 +2028,7 @@ void render_gui() {
     ImGui::Text("Streaming Frequency (max. 70kHz) :");
     ImGui::InputInt("kHz", &selected_freq_khz);
     if (selected_freq_khz < 1) selected_freq_khz = 1;
-
-    ImGui::Text("Capture Mode:");
-    ImGui::RadioButton("Interrupt", &selected_mode, 0); ImGui::SameLine();
-    ImGui::RadioButton("Continuous", &selected_mode, 1);
-
+    
     if (ImGui::Button("Save Config")) save_config_to_json();
     ImGui::SameLine();
     if (ImGui::Button("Load Config")) load_config_from_json();
