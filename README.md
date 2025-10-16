@@ -133,51 +133,6 @@ More info to be added soon.
 If you’d like to support the development of PMT Leech, you can donate via Ko-fi:
 [![Buy Me a Coffee](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/sventronics)
 
-## 📦 Buying the PMT Leech hardware
-You can order from me: 
-- PMT Leech v2 hardware kit (Finalised PCB + USB cable)
-- DIP-28 clipper with jumper wires
-
-📧 Contact: `svenonderbeke [at] hotmail [dot] com` for pricing.
-
-Buying the hardware from me will support my work since it includes a support/license fee
-
-
-## License 📜 
-
-The **PMT Leech** hardware and software are free to use for **personal, educational, and hobbyist purposes**.
-
-If you're using PMT Leech for:
-- Personal projects  
-- Hobby reverse engineering  
-- Non-commercial research or tinkering  
-
-✅ You're free to:
-- Clone this repo  
-- Build the hardware yourself  
-- Modify and experiment with the source code  
-
-🙏 If you find the project useful, consider making a small **donation** to support continued development.
-
-
----
-
-### 💼 Commercial or Company Use
-
-If you're:
-- A company  
-- Using PMT Leech for **financial gain**
-
-❗ You are **not permitted** to use the hardware or software for free.
-
-Instead:
-- Please **purchase official PMT Leech hardware** directly from me.  
-- Part of the purchase cost acts as your **license to use PMT Leech commercially**.
-
-📧 Contact: `svenonderbeke [at] hotmail [dot] com` for pricing.
-
----
-
 ## 🧪 Version
 
 **Current Version:** `PMT Leech v2`
